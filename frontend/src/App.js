@@ -1,0 +1,900 @@
+import React, { Suspense, useEffect, useRef, useState, useMemo } from 'react'
+import { Canvas, useFrame } from '@react-three/fiber'
+import { useGLTF, useTexture, Loader, Environment, useFBX, useAnimations, OrthographicCamera } from '@react-three/drei';
+import { MeshStandardMaterial } from 'three/src/materials/MeshStandardMaterial';
+
+import { LinearEncoding, sRGBEncoding } from 'three/src/constants';
+import { LineBasicMaterial, MeshPhysicalMaterial, Vector2 } from 'three';
+
+import createAnimation from './converter';
+import blinkData from './blendDataBlink.json';
+
+import * as THREE from 'three';
+import axios from 'axios';
+const _ = require('lodash');
+
+// 硬编码服务器地址 - 这里使用你服务器的实际IP
+const SERVER_IP = "172.16.10.158";
+const host = `http://${SERVER_IP}:5000`;
+console.log("后端API地址:", host);
+
+// WebSocket配置
+const wsUrl = `ws://${SERVER_IP}:5000/ws`;
+let websocket = null;
+let clientId = 'client_' + Math.random().toString(36).substr(2, 9);
+
+// 录音相关变量
+let mediaRecorder = null;
+let audioChunks = [];
+
+function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setResponse, setAnimReady, animationData, setAudioElement }) {
+  let gltf = useGLTF(avatar_url);
+  let morphTargetDictionaryBody = null;
+  let morphTargetDictionaryLowerTeeth = null;
+  const mixerRef = useRef(null);
+
+  const [ 
+    bodyTexture, 
+    eyesTexture, 
+    teethTexture, 
+    bodySpecularTexture, 
+    bodyRoughnessTexture, 
+    bodyNormalTexture,
+    teethNormalTexture,
+    hairTexture,
+    tshirtDiffuseTexture,
+    tshirtNormalTexture,
+    tshirtRoughnessTexture,
+    hairAlphaTexture,
+    hairNormalTexture,
+    hairRoughnessTexture,
+    ] = useTexture([
+    "/images/body.webp",
+    "/images/eyes.webp",
+    "/images/teeth_diffuse.webp",
+    "/images/body_specular.webp",
+    "/images/body_roughness.webp",
+    "/images/body_normal.webp",
+    "/images/teeth_normal.webp",
+    "/images/h_color.webp",
+    "/images/tshirt_diffuse.webp",
+    "/images/tshirt_normal.webp",
+    "/images/tshirt_roughness.webp",
+    "/images/h_alpha.webp",
+    "/images/h_normal.webp",
+    "/images/h_roughness.webp",
+  ]);
+
+  _.each([
+    bodyTexture, 
+    eyesTexture, 
+    teethTexture, 
+    teethNormalTexture, 
+    bodySpecularTexture, 
+    bodyRoughnessTexture, 
+    bodyNormalTexture, 
+    tshirtDiffuseTexture, 
+    tshirtNormalTexture, 
+    tshirtRoughnessTexture,
+    hairAlphaTexture,
+    hairNormalTexture,
+    hairRoughnessTexture
+  ], t => {
+    t.encoding = sRGBEncoding;
+    t.flipY = false;
+  });
+
+  bodyNormalTexture.encoding = LinearEncoding;
+  tshirtNormalTexture.encoding = LinearEncoding;
+  teethNormalTexture.encoding = LinearEncoding;
+  hairNormalTexture.encoding = LinearEncoding;
+
+  
+  gltf.scene.traverse(node => {
+    if(node.type === 'Mesh' || node.type === 'LineSegments' || node.type === 'SkinnedMesh') {
+      node.castShadow = true;
+      node.receiveShadow = true;
+      node.frustumCulled = false;
+    
+      if (node.name.includes("Body")) {
+        node.castShadow = true;
+        node.receiveShadow = true;
+        node.material = new MeshPhysicalMaterial();
+        node.material.map = bodyTexture;
+        node.material.roughness = 1.7;
+        node.material.roughnessMap = bodyRoughnessTexture;
+        node.material.normalMap = bodyNormalTexture;
+        node.material.normalScale = new Vector2(0.6, 0.6);
+        morphTargetDictionaryBody = node.morphTargetDictionary;
+        node.material.envMapIntensity = 0.8;
+      }
+
+      if (node.name.includes("Eyes")) {
+        node.material = new MeshStandardMaterial();
+        node.material.map = eyesTexture;
+        node.material.roughness = 0.1;
+        node.material.envMapIntensity = 0.5;
+      }
+
+      if (node.name.includes("Brows")) {
+        node.material = new LineBasicMaterial({color: 0x000000});
+        node.material.linewidth = 1;
+        node.material.opacity = 0.5;
+        node.material.transparent = true;
+        node.visible = false;
+      }
+
+      if (node.name.includes("Teeth")) {
+        node.receiveShadow = true;
+        node.castShadow = true;
+        node.material = new MeshStandardMaterial();
+        node.material.roughness = 0.1;
+        node.material.map = teethTexture;
+        node.material.normalMap = teethNormalTexture;
+        node.material.envMapIntensity = 0.7;
+      }
+
+      if (node.name.includes("Hair")) {
+        node.material = new MeshStandardMaterial();
+        node.material.map = hairTexture;
+        node.material.alphaMap = hairAlphaTexture;
+        node.material.normalMap = hairNormalTexture;
+        node.material.roughnessMap = hairRoughnessTexture;
+        node.material.transparent = true;
+        node.material.depthWrite = false;
+        node.material.side = 2;
+        node.material.color.setHex(0x000000);
+        node.material.envMapIntensity = 0.3;
+      }
+
+      if (node.name.includes("TSHIRT")) {
+        node.material = new MeshStandardMaterial();
+        node.material.map = tshirtDiffuseTexture;
+        node.material.roughnessMap = tshirtRoughnessTexture;
+        node.material.normalMap = tshirtNormalTexture;
+        node.material.color.setHex(0xffffff);
+        node.material.envMapIntensity = 0.5;
+      }
+
+      if (node.name.includes("TeethLower")) {
+        morphTargetDictionaryLowerTeeth = node.morphTargetDictionary;
+      }
+    }
+  });
+
+  const [clips, setClips] = useState([]);
+  const mixer = useMemo(() => {
+    const newMixer = new THREE.AnimationMixer(gltf.scene);
+    mixerRef.current = newMixer;
+    return newMixer;
+  }, []);
+
+  // 当clips变化时，通知App组件动画状态
+  useEffect(() => {
+    if (setAnimReady) {
+      setAnimReady(clips.length > 0);
+    }
+  }, [clips, setAnimReady]);
+
+  // 更新处理动画和音频数据的方法
+  useEffect(() => {
+    if (animationData && animationData.blendData) {
+      console.log("处理动画数据，帧数:", animationData.blendData.length);
+      
+      // 创建动画剪辑
+      const newClips = [ 
+        createAnimation(animationData.blendData, morphTargetDictionaryBody, 'HG_Body'), 
+        createAnimation(animationData.blendData, morphTargetDictionaryLowerTeeth, 'HG_TeethLower') 
+      ];
+      
+      console.log("动画剪辑已创建:", newClips.map(c => c.tracks.length + "个轨道"));
+      
+      // 设置动画剪辑
+      setClips(newClips);
+    }
+  }, [animationData]);
+
+  let idleFbx = useFBX('/idle.fbx');
+  let { clips: idleClips } = useAnimations(idleFbx.animations);
+
+  idleClips[0].tracks = _.filter(idleClips[0].tracks, track => {
+    return track.name.includes("Head") || track.name.includes("Neck") || track.name.includes("Spine2");
+  });
+
+  idleClips[0].tracks = _.map(idleClips[0].tracks, track => {
+    if (track.name.includes("Head")) {
+      track.name = "head.quaternion";
+    }
+
+    if (track.name.includes("Neck")) {
+      track.name = "neck.quaternion";
+    }
+
+    if (track.name.includes("Spine")) {
+      track.name = "spine2.quaternion";
+    }
+
+    return track;
+  });
+
+  useEffect(() => {
+    let idleClipAction = mixer.clipAction(idleClips[0]);
+    idleClipAction.play();
+
+    let blinkClip = createAnimation(blinkData, morphTargetDictionaryBody, 'HG_Body');
+    let blinkAction = mixer.clipAction(blinkClip);
+    blinkAction.play();
+  }, []);
+
+  // Play animation clips when available
+  useEffect(() => {
+    if (playing === false || !clips || clips.length === 0)
+      return;
+    
+    console.log("开始播放动画剪辑，数量:", clips.length);
+    
+    // 停止所有正在播放的动作（除了眨眼和idle）
+    mixer.stopAllAction();
+    
+    // 重新播放基础动画
+    let idleClipAction = mixer.clipAction(idleClips[0]);
+    idleClipAction.play();
+    
+    let blinkClip = createAnimation(blinkData, morphTargetDictionaryBody, 'HG_Body');
+    let blinkAction = mixer.clipAction(blinkClip);
+    blinkAction.play();
+    
+    // 播放新的表情动画
+    _.each(clips, clip => {
+      if (clip && clip.tracks && clip.tracks.length > 0) {
+        let clipAction = mixer.clipAction(clip);
+        clipAction.setLoop(THREE.LoopOnce);
+        clipAction.clampWhenFinished = true; // 动画结束时保持最后一帧
+        clipAction.play();
+        console.log("播放动画剪辑，轨道数:", clip.tracks.length);
+      } else {
+        console.warn("跳过无效的动画剪辑");
+      }
+    });
+  }, [playing, clips]);
+  
+  // 暂停播放时重置动画
+  useEffect(() => {
+    if (playing === false && clips && clips.length > 0 && mixerRef.current) {
+      // 暂停所有当前播放的表情动画
+      _.each(clips, clip => {
+        if (clip && clip.tracks && clip.tracks.length > 0) {
+          const action = mixerRef.current.existingAction(clip);
+          if (action) {
+            action.stop();
+          }
+        }
+      });
+      
+      // 确保基础动画继续播放
+      let idleClipAction = mixerRef.current.clipAction(idleClips[0]);
+      idleClipAction.play();
+      
+      let blinkClip = createAnimation(blinkData, morphTargetDictionaryBody, 'HG_Body');
+      let blinkAction = mixerRef.current.clipAction(blinkClip);
+      blinkAction.play();
+    }
+  }, [playing]);
+
+  useFrame((state, delta) => {
+    mixer.update(delta);
+  });
+
+  return (
+    <group name="avatar">
+      <primitive object={gltf.scene} dispose={null} />
+    </group>
+  );
+}
+
+// 初始化WebSocket连接
+function setupWebSocket(setBackendStatus) {
+  if (websocket && websocket.readyState === WebSocket.OPEN) {
+    console.log("WebSocket已连接，不需要重新连接");
+    return; // WebSocket已经连接
+  }
+
+  // 完整的WebSocket URL
+  const fullWsUrl = `${wsUrl}/${clientId}`;
+  console.log("尝试连接WebSocket:", fullWsUrl);
+  
+  try {
+    const ws = new WebSocket(fullWsUrl);
+    
+    ws.onopen = () => {
+      console.log("WebSocket连接成功");
+      setBackendStatus("已连接 (WebSocket)");
+      websocket = ws;
+      
+      // 发送ping保持连接
+      const pingInterval = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "ping" }));
+        } else {
+          clearInterval(pingInterval);
+        }
+      }, 30000);
+    };
+    
+    ws.onerror = (error) => {
+      console.error("WebSocket错误:", error);
+      setBackendStatus("WebSocket连接失败 - 使用HTTP API");
+      websocket = null;
+    };
+    
+    ws.onclose = () => {
+      console.log("WebSocket连接已关闭");
+      setBackendStatus("使用HTTP API");
+      websocket = null;
+      
+      // 尝试重新连接
+      setTimeout(() => {
+        setupWebSocket(setBackendStatus);
+      }, 5000);
+    };
+    
+    return ws;
+  } catch (error) {
+    console.error("创建WebSocket时出错:", error);
+    setBackendStatus("WebSocket失败 - 使用HTTP API");
+    return null;
+  }
+}
+
+// 初始化麦克风
+async function setupMicrophone(setMicStatus) {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ 
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        sampleRate: 16000, // 设置采样率为16kHz
+        channelCount: 1    // 单声道
+      } 
+    });
+    setMicStatus("麦克风已准备就绪");
+    return stream;
+  } catch (error) {
+    console.error("获取麦克风权限失败:", error);
+    setMicStatus(`麦克风错误: ${error.message}`);
+    return null;
+  }
+}
+
+// 开始录音
+function startRecording(stream, setIsRecording, setRecordingStatus) {
+  if (!stream) return;
+  
+  audioChunks = [];
+  
+  // 配置MediaRecorder，强制使用合适的编码
+  const options = { 
+    mimeType: 'audio/webm',  // 更改为webm格式
+    audioBitsPerSecond: 16000 // 16kHz采样率
+  };
+  
+  try {
+    mediaRecorder = new MediaRecorder(stream, options);
+  } catch (e) {
+    console.warn("WebM格式不支持，尝试使用替代格式");
+    try {
+      // 尝试备用格式
+      mediaRecorder = new MediaRecorder(stream);
+    } catch (e2) {
+      console.error("无法创建MediaRecorder:", e2);
+      setRecordingStatus("浏览器不支持录音功能");
+      return;
+    }
+  }
+  
+  mediaRecorder.ondataavailable = (event) => {
+    if (event.data.size > 0) {
+      audioChunks.push(event.data);
+    }
+  };
+  
+  mediaRecorder.onstart = () => {
+    console.log("录音开始");
+    setIsRecording(true);
+    setRecordingStatus("正在录音...");
+  };
+  
+  mediaRecorder.onstop = () => {
+    console.log("录音结束");
+    setIsRecording(false);
+    setRecordingStatus("录音已停止");
+  };
+  
+  mediaRecorder.start();
+  
+  // 设置自动停止录音的计时器 (最长录音时间，例如10秒)
+  setTimeout(() => {
+    if (mediaRecorder && mediaRecorder.state === "recording") {
+      mediaRecorder.stop();
+    }
+  }, 10000);
+}
+
+const STYLES = {
+  container: {
+    display: 'flex',
+    flexDirection: 'column',
+    height: '100vh',
+    width: '100vw',
+    overflow: 'hidden',
+    position: 'relative'
+  },
+  speechArea: {
+    position: 'absolute', 
+    bottom: '20px', 
+    left: '50%', 
+    transform: 'translateX(-50%)', 
+    zIndex: 500,
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    width: '90%',
+    maxWidth: '600px'
+  },
+  conversationBox: {
+    position: 'absolute',
+    left: '50%', 
+    transform: 'translateX(-50%)',
+    top: '20px',
+    width: '90%',
+    maxWidth: '600px',
+    maxHeight: '40%',
+    overflowY: 'auto',
+    backgroundColor: 'rgba(0, 0, 0, 0.6)',
+    borderRadius: '10px',
+    padding: '15px',
+    zIndex: 500,
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '10px'
+  },
+  userBubble: {
+    backgroundColor: 'rgba(0, 101, 255, 0.7)',
+    padding: '10px 15px',
+    borderRadius: '18px 18px 18px 0',
+    alignSelf: 'flex-start',
+    maxWidth: '80%',
+    wordBreak: 'break-word',
+    color: 'white',
+    marginBottom: '5px'
+  },
+  aiBubble: {
+    backgroundColor: 'rgba(70, 70, 70, 0.7)',
+    padding: '10px 15px',
+    borderRadius: '18px 18px 0 18px',
+    alignSelf: 'flex-end',
+    maxWidth: '80%',
+    wordBreak: 'break-word',
+    color: 'white',
+    marginBottom: '5px'
+  },
+  recordButton: {
+    width: '80px',
+    height: '80px',
+    borderRadius: '50%',
+    backgroundColor: '#cc0000',
+    border: 'none',
+    cursor: 'pointer',
+    display: 'flex',
+    justifyContent: 'center',
+    alignItems: 'center',
+    boxShadow: '0 4px 8px rgba(0, 0, 0, 0.3)',
+    transition: 'all 0.2s ease'
+  },
+  recordingButton: {
+    backgroundColor: '#ff0000',
+    boxShadow: '0 0 0 10px rgba(255, 0, 0, 0.3)'
+  },
+  micIcon: {
+    fontSize: '30px',
+    color: 'white'
+  },
+  statusText: {
+    color: 'white',
+    marginTop: '10px',
+    textAlign: 'center',
+    fontSize: '16px',
+    textShadow: '1px 1px 3px rgba(0, 0, 0, 0.7)'
+  },
+  transcriptText: {
+    backgroundColor: 'rgba(255, 255, 255, 0.2)',
+    padding: '10px',
+    borderRadius: '5px',
+    marginTop: '15px',
+    color: 'white',
+    fontSize: '16px',
+    width: '100%',
+    textAlign: 'center',
+    minHeight: '40px'
+  },
+  statusBar: {
+    position: 'absolute', 
+    bottom: '5px', 
+    left: '10px', 
+    color: '#00FF00', 
+    fontSize: '12px',
+    zIndex: 500
+  },
+  hidden: {
+    display: 'none'
+  }
+};
+
+function App() {
+  // 状态变量
+  const [speak, setSpeak] = useState(false);
+  const [recognizedText, setRecognizedText] = useState("");
+  const [response, setResponse] = useState("");
+  const [playing, setPlaying] = useState(false);
+  const [backendStatus, setBackendStatus] = useState("正在连接...");
+  const [animReady, setAnimReady] = useState(false);
+  const [animationData, setAnimationData] = useState(null);
+  const [micStream, setMicStream] = useState(null);
+  const [micStatus, setMicStatus] = useState("正在初始化麦克风...");
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingStatus, setRecordingStatus] = useState("点击麦克风按钮开始录音");
+  const [loadingStatus, setLoadingStatus] = useState("");
+  const [conversation, setConversation] = useState([]);
+  const [audioElement, setAudioElement] = useState(null);
+  
+  const conversationRef = useRef(null);
+
+  // 当会话内容更新时，自动滚动到底部
+  useEffect(() => {
+    if (conversationRef.current) {
+      conversationRef.current.scrollTop = conversationRef.current.scrollHeight;
+    }
+  }, [conversation]);
+
+  // 停止录音并发送到服务器
+  const stopRecording = async () => {
+    if (!mediaRecorder) return;
+    
+    return new Promise((resolve) => {
+      mediaRecorder.onstop = async () => {
+        console.log("录音已完成，处理中...");
+        setIsRecording(false);
+        setRecordingStatus("处理录音...");
+        setLoadingStatus("正在处理语音...");
+        
+        const audioBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+        console.log("录音文件大小:", audioBlob.size, "字节", "类型:", audioBlob.type);
+        
+        try {
+          // 发送音频到服务器
+          if (websocket && websocket.readyState === WebSocket.OPEN) {
+            // 通过WebSocket发送
+            sendAudioViaWebSocket(audioBlob);
+          } else {
+            // 通过HTTP请求发送
+            await sendAudioViaHttp(audioBlob);
+          }
+        } catch (error) {
+          console.error("处理音频时出错:", error);
+          setLoadingStatus(`处理音频失败: ${error.message}`);
+        }
+        
+        resolve();
+      };
+      
+      mediaRecorder.stop();
+    });
+  };
+
+  // 通过WebSocket发送音频
+  const sendAudioViaWebSocket = (audioBlob) => {
+    console.log("通过WebSocket发送音频");
+    
+    // 创建表单数据
+    const reader = new FileReader();
+    reader.onload = () => {
+      const base64data = reader.result.split(',')[1];
+      
+      websocket.send(JSON.stringify({
+        type: "speech_recognition",
+        audio_data: base64data,
+        audio_format: audioBlob.type || "audio/webm",
+        client_id: clientId
+      }));
+      
+      setLoadingStatus("语音识别中...");
+    };
+    
+    reader.readAsDataURL(audioBlob);
+  };
+
+  // 通过HTTP发送音频
+  const sendAudioViaHttp = async (audioBlob) => {
+    console.log("通过HTTP API发送音频");
+    
+    const formData = new FormData();
+    formData.append('audio', audioBlob);
+    formData.append('client_id', clientId);
+    formData.append('audio_format', audioBlob.type || "audio/webm");
+    
+    try {
+      setLoadingStatus("发送音频到服务器...");
+      const response = await axios.post(`${host}/recognize_speech`, formData, {
+        headers: {
+          'Content-Type': 'multipart/form-data'
+        }
+      });
+      
+      console.log("语音识别响应:", response.data);
+      if (response.data && response.data.text) {
+        // 自动设置识别出的文本
+        setRecognizedText(response.data.text);
+        // 更新对话历史
+        setConversation(prev => [...prev, {
+          role: 'user',
+          content: response.data.text
+        }]);
+        setLoadingStatus("开始处理识别到的文本");
+      } else {
+        setLoadingStatus("语音识别失败");
+      }
+    } catch (error) {
+      console.error("发送音频失败:", error);
+      setLoadingStatus(`发送音频失败: ${error.message}`);
+    }
+  };
+
+  // 初始化WebSocket
+  useEffect(() => {
+    setupWebSocket(setBackendStatus);
+  }, []);
+
+  // 初始化麦克风
+  useEffect(() => {
+    async function initMic() {
+      const stream = await setupMicrophone(setMicStatus);
+      setMicStream(stream);
+    }
+    
+    initMic();
+    
+    // 组件卸载时关闭麦克风
+    return () => {
+      if (micStream) {
+        micStream.getTracks().forEach(track => track.stop());
+      }
+    };
+  }, []);
+
+  // 设置WebSocket消息处理
+  useEffect(() => {
+    if (websocket) {
+      websocket.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data);
+          console.log("收到WebSocket消息:", message);
+          
+          if (message.type === "processing_complete") {
+            console.log("处理完成，获取Blendshape数据和音频");
+            
+            // 确保音频URL是完整路径
+            let audioPath = message.filename;
+            if (!audioPath.startsWith('http')) {
+              audioPath = `${host}${audioPath}`;
+            }
+            console.log("完整音频URL:", audioPath);
+            
+            // 保存动画数据
+            setAnimationData({ blendData: message.blendData });
+            
+            // 创建音频元素
+            const audio = new Audio(audioPath);
+            audio.oncanplay = () => {
+              console.log("音频已加载，准备播放");
+              audio.play()
+                .then(() => {
+                  console.log("开始播放音频");
+                  setPlaying(true);
+                })
+                .catch(error => {
+                  console.error("播放音频失败:", error);
+                });
+            };
+            
+            audio.onended = () => {
+              console.log("音频播放结束");
+              setPlaying(false);
+              setAnimationData(null);
+            };
+            
+            setAudioElement(audio);
+            
+            if (message.text) {
+              setResponse(message.text);
+              // 添加到对话历史
+              setConversation(prev => [...prev, {
+                role: 'assistant',
+                content: message.text
+              }]);
+            }
+            
+            // 重置加载状态
+            setLoadingStatus("");
+          } 
+          else if (message.type === "ai_response") {
+            console.log("收到AI响应:", message.text);
+            if (message.text) {
+              setResponse(message.text);
+            }
+          }
+          else if (message.type === "speech_recognition_result") {
+            console.log("收到语音识别结果:", message.text);
+            if (message.text) {
+              setRecognizedText(message.text);
+              // 添加到对话历史
+              setConversation(prev => [...prev, {
+                role: 'user',
+                content: message.text
+              }]);
+              setLoadingStatus("识别完成，等待回复...");
+            } else {
+              setLoadingStatus("语音识别结果为空");
+            }
+          }
+          else if (message.type === "error") {
+            console.error("WebSocket错误:", message.message);
+            alert(`处理时出错: ${message.message}`);
+            setLoadingStatus("");
+          }
+        } catch (error) {
+          console.error("解析WebSocket消息时出错:", error);
+          setLoadingStatus("");
+        }
+      };
+    }
+  }, [websocket]);
+
+  // 检查后端服务状态
+  useEffect(() => {
+    fetch(`${host}/docs`)
+      .then(response => {
+        if(response.ok) {
+          setBackendStatus("REST API已连接");
+          // 如果REST API可用，尝试连接WebSocket
+          setupWebSocket(setBackendStatus);
+        } else {
+          setBackendStatus("后端服务连接失败");
+        }
+      })
+      .catch(err => {
+        console.error("后端服务连接错误:", err);
+        setBackendStatus(`后端服务不可用: ${err.message}`);
+      });
+  }, []);
+
+  // 处理录音按钮点击
+  const handleRecordClick = async () => {
+    if (isRecording) {
+      // 停止录音
+      await stopRecording();
+    } else {
+      // 开始录音
+      if (micStream) {
+        startRecording(micStream, setIsRecording, setRecordingStatus);
+      } else {
+        // 尝试重新获取麦克风权限
+        const stream = await setupMicrophone(setMicStatus);
+        if (stream) {
+          setMicStream(stream);
+          startRecording(stream, setIsRecording, setRecordingStatus);
+        } else {
+          alert("无法访问麦克风。请检查权限设置。");
+        }
+      }
+    }
+  };
+
+  return (
+    <div style={STYLES.container}>
+      {/* 对话历史 */}
+      {conversation.length > 0 && (
+        <div style={STYLES.conversationBox} ref={conversationRef}>
+          {conversation.map((msg, index) => (
+            <div 
+              key={index} 
+              style={msg.role === 'user' ? STYLES.userBubble : STYLES.aiBubble}
+            >
+              {msg.content}
+            </div>
+          ))}
+        </div>
+      )}
+      
+      {/* 语音输入区域 */}
+      <div style={STYLES.speechArea}>
+        {recognizedText && (
+          <div style={STYLES.transcriptText}>
+            {recognizedText}
+          </div>
+        )}
+        
+        <button 
+          onClick={handleRecordClick}
+          style={{
+            ...STYLES.recordButton,
+            ...(isRecording ? STYLES.recordingButton : {})
+          }}
+          disabled={loadingStatus.includes("处理中") || loadingStatus.includes("等待")}
+        >
+          <span style={STYLES.micIcon}>
+            {isRecording ? '■' : '🎤'}
+          </span>
+        </button>
+        
+        <div style={STYLES.statusText}>
+          {isRecording ? '正在录音...' : (loadingStatus || '点击麦克风开始语音输入')}
+        </div>
+      </div>
+      
+      {/* 状态栏 */}
+      <div style={STYLES.statusBar}>
+        {backendStatus} | 动画: {animReady ? '已加载' : '无'} | {micStatus}
+      </div>
+      
+      <Canvas dpr={2} onCreated={(ctx) => {
+          ctx.gl.physicallyCorrectLights = true;
+        }}>
+
+        <OrthographicCamera 
+        makeDefault
+        zoom={2000}
+        position={[0, 1.65, 1]}
+        />
+
+        <Suspense fallback={null}>
+          <Environment background={false} files="/images/photo_studio_loft_hall_1k.hdr" />
+        </Suspense>
+
+        <Suspense fallback={null}>
+          <Bg />
+        </Suspense>
+
+        <Suspense fallback={null}>
+            <Avatar 
+              avatar_url="/model.glb" 
+              speak={speak} 
+              setSpeak={setSpeak}
+              text={recognizedText}
+              playing={playing}
+              setPlaying={setPlaying}
+              setResponse={setResponse}
+              setAnimReady={setAnimReady}
+              animationData={animationData}
+              setAudioElement={setAudioElement}
+              />
+        </Suspense>
+
+      </Canvas>
+      <Loader dataInterpolation={(p) => `加载中... ${Math.round(p * 100)}%`} />
+    </div>
+  )
+}
+
+function Bg() {
+  const texture = useTexture('/images/bg.webp');
+
+  return(
+    <mesh position={[0, 1.5, -2]} scale={[0.8, 0.8, 0.8]}>
+      <planeBufferGeometry />
+      <meshBasicMaterial map={texture} />
+    </mesh>
+  )
+}
+
+export default App;
