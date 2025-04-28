@@ -1,1 +1,1 @@
-# digital_human
+# digital-human
