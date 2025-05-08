@@ -9,6 +9,8 @@ import traceback
 import math
 from typing import List, Dict, Optional, Tuple, Generator
 import logging
+import pandas as pd
+from scipy import signal  # 用于简化版Blendshape生成
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -47,6 +49,168 @@ except ImportError as e:
         logger.error(f"导入本地生成的模块也失败: {e}")
         logger.error("需要先生成gRPC模块，请运行proto_generator.py")
         raise
+
+# 新增：简化版Blendshape生成器（省去调用Audio2Face-3D服务的复杂过程）
+class SimpleBlendshapeGenerator:
+    """基于音频振幅的简化版Blendshape生成器"""
+    
+    def __init__(self):
+        """初始化简化版Blendshape生成器"""
+        # ARKit Blendshape 名称列表 (精简版，只保留关键的口型相关Blendshape)
+        self.blendshape_names = [
+            "EyeBlinkLeft", "EyeBlinkRight", "JawOpen", "MouthClose", 
+            "MouthFunnel", "MouthPucker", "MouthLeft", "MouthRight", 
+            "MouthSmileLeft", "MouthSmileRight", "MouthFrownLeft", "MouthFrownRight",
+            "MouthUpperUpLeft", "MouthUpperUpRight", "MouthLowerDownLeft", "MouthLowerDownRight"
+        ]
+        logger.info("初始化简化版Blendshape生成器")
+    
+    def generate_blendshape_from_audio(self, audio_samples, output_csv_path, sample_rate=16000, fps=30):
+        """
+        从音频样本生成简化的Blendshape数据
+        
+        参数:
+            audio_samples: 音频样本数据 (numpy数组)
+            output_csv_path: 输出CSV文件路径
+            sample_rate: 音频采样率
+            fps: 动画帧率
+        
+        返回:
+            成功返回True，否则返回False
+        """
+        logger.info(f"使用简化方法生成Blendshape，采样率: {sample_rate}, fps: {fps}")
+        
+        try:
+            # 确保音频数据是numpy数组
+            if not isinstance(audio_samples, np.ndarray):
+                audio_samples = np.array(audio_samples)
+            
+            # 正规化音频数据
+            if audio_samples.dtype != np.float32:
+                audio_samples = audio_samples.astype(np.float32)
+                if np.max(np.abs(audio_samples)) > 1.0:
+                    audio_samples = audio_samples / 32768.0  # 假设16位音频
+            
+            # 计算每帧的音频样本数
+            samples_per_frame = int(sample_rate / fps)
+            num_frames = math.ceil(len(audio_samples) / samples_per_frame)
+            
+            # 计算音频能量包络
+            # 使用短时傅里叶变换(STFT)计算频谱
+            _, _, spectrogram = signal.stft(
+                audio_samples, 
+                fs=sample_rate, 
+                nperseg=512, 
+                noverlap=256
+            )
+            
+            # 计算能量包络 (频谱的幅度平方)
+            energy = np.sum(np.abs(spectrogram)**2, axis=0)
+            
+            # 重采样能量包络到视频帧率
+            energy_frames = np.zeros(num_frames)
+            for i in range(min(num_frames, len(energy))):
+                energy_frames[i] = energy[i]
+            
+            # 平滑能量包络
+            energy_frames = signal.savgol_filter(energy_frames, 5, 2)
+            
+            # 正规化能量包络
+            energy_max = np.max(energy_frames)
+            if energy_max > 0:
+                energy_frames = energy_frames / energy_max
+            
+            # 创建Blendshape数据
+            blend_data = []
+            for frame_idx in range(num_frames):
+                time_point = frame_idx / fps
+                energy_val = energy_frames[frame_idx]
+                
+                # 创建帧数据
+                frame_data = {
+                    "frame": frame_idx,
+                    "time": time_point,
+                    "time_code": frame_idx / fps
+                }
+                
+                # 基于音频能量添加Blendshape值
+                # JawOpen - 主要受音频能量影响
+                frame_data["JawOpen"] = np.clip(energy_val * 1.2, 0.0, 1.0)
+                
+                # MouthClose - 与JawOpen相反
+                frame_data["MouthClose"] = 1.0 - frame_data["JawOpen"] * 0.8
+                
+                # 添加微笑和其他口型的变化（基于音频能量和一些随机性）
+                smile_val = energy_val * 0.5 + np.sin(time_point * 2) * 0.1
+                frame_data["MouthSmileLeft"] = np.clip(smile_val, 0.0, 0.6)
+                frame_data["MouthSmileRight"] = np.clip(smile_val, 0.0, 0.6)
+                
+                # 添加其他Blendshape（眨眼等）的基本动画
+                if frame_idx % 90 == 0:  # 约3秒眨一次眼
+                    frame_data["EyeBlinkLeft"] = 1.0
+                    frame_data["EyeBlinkRight"] = 1.0
+                elif frame_idx % 90 == 1:  # 眨眼后的下一帧
+                    frame_data["EyeBlinkLeft"] = 0.5
+                    frame_data["EyeBlinkRight"] = 0.5
+                else:
+                    frame_data["EyeBlinkLeft"] = 0.0
+                    frame_data["EyeBlinkRight"] = 0.0
+                
+                # 添加其他口型动画
+                if energy_val > 0.7:  # 高能量时的特殊口型
+                    frame_data["MouthPucker"] = np.clip((energy_val - 0.7) * 2, 0, 0.5)
+                else:
+                    frame_data["MouthPucker"] = 0.0
+                
+                # 上下嘴唇运动
+                frame_data["MouthUpperUpLeft"] = frame_data["JawOpen"] * 0.3
+                frame_data["MouthUpperUpRight"] = frame_data["JawOpen"] * 0.3
+                frame_data["MouthLowerDownLeft"] = frame_data["JawOpen"] * 0.5
+                frame_data["MouthLowerDownRight"] = frame_data["JawOpen"] * 0.5
+                
+                # 将非零值添加到结果中
+                blend_data.append(frame_data)
+            
+            # 保存Blendshape数据到CSV
+            return self.save_blendshape_to_csv(blend_data, output_csv_path)
+        
+        except Exception as e:
+            logger.error(f"生成简化Blendshape数据时出错: {e}")
+            traceback.print_exc()
+            return False
+    
+    def save_blendshape_to_csv(self, blendshape_data, output_csv_path):
+        """将Blendshape数据保存为CSV文件"""
+        if not blendshape_data:
+            logger.error("没有Blendshape数据可保存")
+            return False
+            
+        try:
+            # 确保输出目录存在
+            output_dir = os.path.dirname(output_csv_path)
+            if output_dir and not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+                
+            # 获取所有字段名
+            fieldnames = ["frame", "time", "time_code"]
+            fieldnames.extend(self.blendshape_names)
+            
+            # 写入CSV文件
+            with open(output_csv_path, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                
+                for frame_data in blendshape_data:
+                    # 创建一个只包含已知字段的行
+                    row = {field: frame_data.get(field, 0.0) for field in fieldnames}
+                    writer.writerow(row)
+            
+            logger.info(f"简化Blendshape数据已保存至: {output_csv_path}")
+            return True
+        except Exception as e:
+            logger.error(f"保存Blendshape数据到CSV时出错: {e}")
+            traceback.print_exc()
+            return False
 
 class Audio2Face3DClient:
     """与Audio2Face-3D gRPC服务交互的客户端"""

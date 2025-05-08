@@ -14,7 +14,7 @@ import traceback
 import logging
 import soundfile as sf
 import pandas as pd
-import matplotlib.pyplot as plt
+from concurrent.futures import ThreadPoolExecutor
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -50,6 +50,9 @@ client = openai.OpenAI(
     api_key=api_key
 )
 
+# 使用线程池执行耗时操作
+executor = ThreadPoolExecutor(max_workers=4)
+
 # 移除括号内的文本
 def clean_text(text):
     text = re.sub(r'（.*?）', '', text)
@@ -80,12 +83,15 @@ def load_cosyvoice_model():
             logger.error("找不到CosyVoice2模型")
             return None
         
-        # 加载模型
+        # 加载模型时使用优化选项
         logger.info(f"加载CosyVoice2模型: {model_path}")
+        
+        # 优化：启用FP16加速和JIT编译
         cosyvoice = CosyVoice2(model_path, 
-                             load_jit=False, 
-                             load_trt=False, 
-                             fp16=False)
+                             load_jit=True,  # 使用JIT编译加速
+                             load_trt=False, # 不使用TensorRT
+                             fp16=True)      # 使用半精度加速
+                             
         logger.info("CosyVoice2模型加载成功")
         return cosyvoice
     except Exception as e:
@@ -134,7 +140,7 @@ def get_consistent_reference_audio(model, audio_dir):
                     logger.info(f"参考音频已创建: {prompt_path}")
                 else:
                     logger.warning("无法生成参考音频，使用临时音频")
-                    return None  # 返回None而不是可能的张量
+                    return None
                 
                 # 清理临时文件
                 if os.path.exists(temp_ref_path):
@@ -142,7 +148,7 @@ def get_consistent_reference_audio(model, audio_dir):
             except Exception as e:
                 logger.error(f"创建参考音频失败: {e}")
                 traceback.print_exc()
-                return None  # 确保发生错误时返回None
+                return None
         
         # 加载并缓存参考音频
         try:
@@ -151,11 +157,12 @@ def get_consistent_reference_audio(model, audio_dir):
             return reference_audio
         except Exception as e:
             logger.error(f"加载参考音频失败: {e}")
-            return None  # 确保发生错误时返回None
+            return None
     except Exception as e:
         logger.error(f"处理参考音频时出错: {e}")
-        return None  # 确保发生任何错误时返回None
+        return None
 
+# 优化：使用更快的AI响应获取方法
 async def get_ai_response(user_input, messages=None):
     try:
         if messages is None:
@@ -164,9 +171,13 @@ async def get_ai_response(user_input, messages=None):
         messages.append({"role": "user", "content": user_input})
         
         logger.info(f"发送用户输入到AI: {user_input[:50]}...")
+        
+        # 优化1: 减少生成长度和降低温度值加快速度
         response = await asyncio.to_thread(client.chat.completions.create,
              model="model",
              messages=messages,
+             max_tokens=200,       # 减少最大标记数以加快响应速度
+             temperature=0.7,      # 降低温度值，让模型更快做出决策
              stream=False
         )
 
@@ -188,7 +199,7 @@ async def get_ai_response(user_input, messages=None):
         return "获取响应出错，请稍后再试"
 
 # 将文本分割成句子，确保每个句子不会太长
-def split_into_sentences(text, max_length=80):
+def split_into_sentences(text, max_length=100):
     # 查找自然句子边界
     sentence_boundaries = []
     for match in re.finditer(r'[。！？\.!?;；\n]', text):
@@ -235,15 +246,12 @@ def split_into_sentences(text, max_length=80):
     
     return sentences
 
-# 为单个句子生成音频
+# 为单个句子生成音频 - 优化版本，减少内存清理
 async def generate_audio_for_sentence(text, model, reference_audio):
     try:
         instruction = "用普通话说这句话"
         
-        # 强制清理内存以避免OOM
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-            
-        logger.debug(f"生成句子音频: {text[:30]}...")
+        # 使用JIT编译的模型进行更快的推理
         results = list(model.inference_instruct2(
             text,
             instruction,
@@ -265,132 +273,106 @@ async def generate_audio_for_sentence(text, model, reference_audio):
         logger.error(f"句子生成错误: {e}")
         return None
 
-# 批处理句子
-async def process_sentences_in_batches(sentences, model, reference_audio, batch_size=3):
-    all_audio_segments = []
+# 并行处理句子生成音频 - 优化版本，使用线程池
+async def parallel_generate_audio(sentences, model, reference_audio):
+    """并行处理多个句子生成音频"""
+    if not sentences:
+        return []
+        
+    # 创建任务列表
+    tasks = []
+    for sentence in sentences:
+        if sentence.strip():
+            task = asyncio.create_task(generate_audio_for_sentence(sentence, model, reference_audio))
+            tasks.append(task)
     
-    # 批处理句子
-    for i in range(0, len(sentences), batch_size):
-        batch = sentences[i:i+batch_size]
-        
-        # 处理当前批次
-        batch_tasks = []
-        for sentence in batch:
-            if sentence.strip():  # 只处理非空句子
-                task = generate_audio_for_sentence(sentence, model, reference_audio)
-                batch_tasks.append(task)
-        
-        # 等待当前批次完成
-        batch_results = await asyncio.gather(*batch_tasks)
-        
-        # 收集结果
-        for result in batch_results:
-            if result is not None:
-                all_audio_segments.append(result)
-        
-        # 强制清理内存
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    # 等待所有任务完成
+    results = await asyncio.gather(*tasks)
     
-    return all_audio_segments
+    # 过滤掉None结果
+    return [result for result in results if result is not None]
 
-# 使用CosyVoice进行文本到语音转换
-async def text_to_speech_cosyvoice(text, model, reference_audio, audio_dir):
+# 优化的TTS函数 - 单一高性能模式
+async def text_to_speech_optimized(text, model, reference_audio, audio_dir):
+    """优化的TTS函数 - 平衡速度和质量"""
+    start_time = time.time()
     try:
         if model is None:
             logger.error("CosyVoice2模型未加载")
             return None, None
-        
-        if reference_audio is None:  # 改为检查是否为None
+            
+        if reference_audio is None:
             logger.error("无法获取参考音频")
             return None, None
-        
-        
-        # 特殊处理短文本
-        if len(text) <= 100:
-            try:
-                logger.info(f"处理短文本直接生成: {text[:50]}...")
-                single_audio = await generate_audio_for_sentence(text, model, reference_audio)
-                if single_audio is not None:
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    wavfile_path = os.path.join(audio_dir, f"response_audio_{timestamp}.wav")
-                    sample_rate = model.sample_rate
-                    sf.write(wavfile_path, single_audio, sample_rate)
-                    logger.info(f"短文本音频已保存: {wavfile_path}")
-                    return single_audio, wavfile_path
-            except Exception as e:
-                logger.error(f"短文本生成失败: {e}, 尝试分段...")
-        
-        # 将文本分割成句子
-        sentences = split_into_sentences(text)
-        if not sentences:
-            logger.error("文本分割后为空")
-            return None, None
             
+        # 清理GPU内存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        # 特殊处理短文本 - 直接生成不分割
+        if len(text) <= 50:
+            logger.info(f"处理短文本直接生成: {text}")
+            audio_np = await generate_audio_for_sentence(text, model, reference_audio)
+            
+            if audio_np is not None:
+                # 保存音频
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                wavfile_path = os.path.join(audio_dir, f"response_audio_{timestamp}.wav")
+                sample_rate = model.sample_rate
+                sf.write(wavfile_path, audio_np, sample_rate)
+                
+                logger.info(f"短文本音频已保存: {wavfile_path}")
+                logger.info(f"TTS处理时间: {time.time() - start_time:.2f}秒")
+                return audio_np, wavfile_path
+            else:
+                logger.error("短文本音频生成失败")
+        
+        # 分割文本为句子
+        sentences = split_into_sentences(text, max_length=100)
         logger.info(f"文本已分割为 {len(sentences)} 个句子")
         
-        # 并发处理所有句子
-        audio_segments = await process_sentences_in_batches(
-            sentences, 
-            model, 
-            reference_audio
-        )
+        # 尝试批量并行处理，一次处理所有句子
+        audio_segments = await parallel_generate_audio(sentences, model, reference_audio)
         
         if not audio_segments:
             logger.error("没有成功生成的音频片段")
             return None, None
-        
+            
         logger.info(f"成功生成 {len(audio_segments)} 个音频片段")
         
-        # 连接片段
+        # 连接片段 - 使用更短的暂停
         sample_rate = model.sample_rate
-        pause_duration = 0.2  
+        pause_duration = 0.1  # 使用极短的暂停
         pause_samples = np.zeros(int(pause_duration * sample_rate))
         
+        # 合并所有段
         combined_segments = []
         for segment in audio_segments:
-            if segment is not None and len(segment) > 0:
-                max_val = np.max(np.abs(segment))
-                if max_val > 0:
-                    segment = segment / max_val * 0.8  
-                
+            if len(segment) > 0:
                 combined_segments.append(segment)
                 combined_segments.append(pause_samples)
-        
+                
         if combined_segments and len(combined_segments) > 1:
             combined_segments.pop()  # 移除最后一个暂停
+            
+        # 合并音频
+        combined_audio = np.concatenate(combined_segments)
         
-        # 合并所有片段
-        try:
-            combined_audio = np.concatenate(combined_segments)
+        # 归一化音频
+        max_val = np.max(np.abs(combined_audio))
+        if max_val > 0:
+            combined_audio = combined_audio / max_val * 0.9
             
-            # 最终归一化
-            max_val = np.max(np.abs(combined_audio))
-            if max_val > 0:
-                combined_audio = combined_audio / max_val * 0.9
-                
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            wavfile_path = os.path.join(audio_dir, f"response_audio_{timestamp}.wav")
-            sf.write(wavfile_path, combined_audio, sample_rate)
-            logger.info(f"合并音频已保存: {wavfile_path}")
+        # 保存最终音频
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        wavfile_path = os.path.join(audio_dir, f"response_audio_{timestamp}.wav")
+        sf.write(wavfile_path, combined_audio, sample_rate)
+        
+        total_time = time.time() - start_time
+        logger.info(f"TTS处理完成，耗时: {total_time:.2f}秒")
+        return combined_audio, wavfile_path
             
-            # 音频数据长度信息
-            audio_duration = len(combined_audio) / sample_rate
-            logger.info(f"音频长度: {audio_duration:.2f}秒")
-            
-            return combined_audio, wavfile_path
-        except Exception as e:
-            logger.error(f"音频合并错误: {e}")
-            traceback.print_exc()
-            
-            if audio_segments:
-                # 如果合并失败，返回第一个片段
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                wavfile_path = os.path.join(audio_dir, f"response_audio_{timestamp}.wav")
-                sf.write(wavfile_path, audio_segments[0], sample_rate)
-                logger.info(f"合并失败，保存第一个片段: {wavfile_path}")
-                return audio_segments[0], wavfile_path
     except Exception as e:
-        logger.error(f"语音合成处理错误: {e}")
+        logger.error(f"TTS处理错误: {e}")
         traceback.print_exc()
-    
-    return None, None
+        return None, None

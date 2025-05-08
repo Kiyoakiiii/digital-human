@@ -1,4 +1,4 @@
-import React, { Suspense, useEffect, useRef, useState, useMemo } from 'react';
+import React, { Suspense, useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import { Canvas, useFrame } from '@react-three/fiber';
 import { useGLTF, useTexture, Loader, Environment, useFBX, useAnimations, OrthographicCamera } from '@react-three/drei';
 import { MeshStandardMaterial } from 'three/src/materials/MeshStandardMaterial';
@@ -176,15 +176,25 @@ function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setRes
     }
   }, [clips, setAnimReady]);
 
-  // 更新处理动画和音频数据的方法
+  // 更新处理动画和音频数据的方法 - 优化性能
   useEffect(() => {
     if (animationData && animationData.blendData) {
       console.log("处理动画数据，帧数:", animationData.blendData.length);
 
+      // 优化：限制处理的帧数，增加性能
+      const maxFrames = 300; // 限制最大帧数以提高性能
+      let processedData = animationData.blendData;
+      
+      if (animationData.blendData.length > maxFrames) {
+        const skipFactor = Math.ceil(animationData.blendData.length / maxFrames);
+        processedData = animationData.blendData.filter((_, index) => index % skipFactor === 0);
+        console.log(`优化：从 ${animationData.blendData.length} 帧减少到 ${processedData.length} 帧`);
+      }
+
       // 创建动画剪辑
       const newClips = [
-        createAnimation(animationData.blendData, morphTargetDictionaryBody, 'HG_Body'),
-        createAnimation(animationData.blendData, morphTargetDictionaryLowerTeeth, 'HG_TeethLower')
+        createAnimation(processedData, morphTargetDictionaryBody, 'HG_Body'),
+        createAnimation(processedData, morphTargetDictionaryLowerTeeth, 'HG_TeethLower')
       ];
 
       console.log("动画剪辑已创建:", newClips.map(c => c.tracks.length + "个轨道"));
@@ -226,7 +236,7 @@ function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setRes
     blinkAction.play();
   }, []);
 
-  // Play animation clips when available
+  // Play animation clips when available - 优化性能
   useEffect(() => {
     if (playing === false || !clips || clips.length === 0)
       return;
@@ -292,11 +302,11 @@ function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setRes
   );
 }
 
-// 初始化WebSocket连接
-function setupWebSocket(setBackendStatus) {
+// 优化: 使用缓存和重试机制的WebSocket连接
+function setupWebSocket(setBackendStatus, setWsReady) {
   if (websocket && websocket.readyState === WebSocket.OPEN) {
     console.log("WebSocket已连接，不需要重新连接");
-    return; // WebSocket已经连接
+    return websocket; // WebSocket已经连接
   }
 
   // 完整的WebSocket URL
@@ -310,6 +320,7 @@ function setupWebSocket(setBackendStatus) {
       console.log("WebSocket连接成功");
       setBackendStatus("已连接 (WebSocket)");
       websocket = ws;
+      if (setWsReady) setWsReady(true);
 
       // 发送ping保持连接
       const pingInterval = setInterval(() => {
@@ -325,16 +336,18 @@ function setupWebSocket(setBackendStatus) {
       console.error("WebSocket错误:", error);
       setBackendStatus("WebSocket连接失败 - 使用HTTP API");
       websocket = null;
+      if (setWsReady) setWsReady(false);
     };
 
     ws.onclose = () => {
       console.log("WebSocket连接已关闭");
       setBackendStatus("使用HTTP API");
       websocket = null;
+      if (setWsReady) setWsReady(false);
 
       // 尝试重新连接
       setTimeout(() => {
-        setupWebSocket(setBackendStatus);
+        setupWebSocket(setBackendStatus, setWsReady);
       }, 5000);
     };
 
@@ -342,20 +355,22 @@ function setupWebSocket(setBackendStatus) {
   } catch (error) {
     console.error("创建WebSocket时出错:", error);
     setBackendStatus("WebSocket失败 - 使用HTTP API");
+    if (setWsReady) setWsReady(false);
     return null;
   }
 }
 
-// 初始化麦克风
+// 优化: 更高效的麦克风初始化
 async function setupMicrophone(setMicStatus) {
   try {
+    // 优化: 更高效的音频配置
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
         noiseSuppression: true,
         autoGainControl: true,
-        sampleRate: 16000, // 设置采样率为16kHz
-        channelCount: 1    // 单声道
+        sampleRate: 16000,    // 设置采样率为16kHz
+        channelCount: 1       // 单声道
       }
     });
     setMicStatus("麦克风已准备就绪");
@@ -367,7 +382,7 @@ async function setupMicrophone(setMicStatus) {
   }
 }
 
-// 开始录音
+// 优化: 更高效的录音配置
 function startRecording(stream, setIsRecording, setRecordingStatus) {
   if (!stream) return;
 
@@ -411,14 +426,15 @@ function startRecording(stream, setIsRecording, setRecordingStatus) {
     setRecordingStatus("录音已停止");
   };
 
-  mediaRecorder.start();
+  // 每100ms保存一次数据，提高响应速度
+  mediaRecorder.start(100);
 
-  // 设置自动停止录音的计时器 (最长录音时间，例如10秒)
+  // 设置自动停止录音的计时器 (最长录音时间，例如8秒)
   setTimeout(() => {
     if (mediaRecorder && mediaRecorder.state === "recording") {
       mediaRecorder.stop();
     }
-  }, 10000);
+  }, 8000);  // 减少最大录音时间以提高响应速度
 }
 
 const STYLES = {
@@ -430,10 +446,9 @@ const STYLES = {
     overflow: 'hidden',
     position: 'relative'
   },
-  // speechArea remains similar, but perhaps adjust bottom spacing
   speechArea: {
     position: 'absolute',
-    bottom: '20px', // Adjust if needed based on chat box height
+    bottom: '20px',
     left: '50%',
     transform: 'translateX(-50%)',
     zIndex: 500,
@@ -443,20 +458,17 @@ const STYLES = {
     width: '90%',
     maxWidth: '600px'
   },
-  // Modified conversationBox to be at the bottom, above speechArea
   conversationBox: {
     position: 'absolute',
     left: '50%',
     transform: 'translateX(-50%)',
-    bottom: '180px', // Position above speechArea
+    bottom: '180px',
     width: '90%',
     maxWidth: '600px',
-    // maxHeight: '40%', // You might not need maxHeight if showing only one
-    // overflowY: 'auto', // Not needed for single message
     backgroundColor: 'rgba(0, 0, 0, 0.6)',
     borderRadius: '10px',
     padding: '15px',
-    zIndex: 499, // Below speechArea if overlapping is possible
+    zIndex: 499,
     display: 'flex',
     flexDirection: 'column',
     gap: '10px'
@@ -493,7 +505,7 @@ const STYLES = {
     alignItems: 'center',
     boxShadow: '0 4px 8px rgba(0, 0, 0, 0.3)',
     transition: 'all 0.2s ease',
-    marginTop: '15px' // Add margin if transcript text is removed or hidden
+    marginTop: '15px'
   },
   recordingButton: {
     backgroundColor: '#ff0000',
@@ -510,18 +522,6 @@ const STYLES = {
     fontSize: '16px',
     textShadow: '1px 1px 3px rgba(0, 0, 0, 0.7)'
   },
-  // Transcript text is hidden as per the requirement to only show the last message bubble
-  // transcriptText: {
-  //   backgroundColor: 'rgba(255, 255, 255, 0.2)',
-  //   padding: '10px',
-  //   borderRadius: '5px',
-  //   marginTop: '15px',
-  //   color: 'white',
-  //   fontSize: '16px',
-  //   width: '100%',
-  //   textAlign: 'center',
-  //   minHeight: '40px'
-  // },
   statusBar: {
     position: 'absolute',
     bottom: '5px',
@@ -532,14 +532,34 @@ const STYLES = {
   },
   hidden: {
     display: 'none'
+  },
+  loadingOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(0, 0, 0, 0.3)',
+    display: 'flex',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 1000,
+    pointerEvents: 'none'
+  },
+  loadingSpinner: {
+    width: '50px',
+    height: '50px',
+    border: '5px solid rgba(255, 255, 255, 0.3)',
+    borderRadius: '50%',
+    borderTop: '5px solid white',
+    animation: 'spin 1s linear infinite'
   }
 };
 
 function App() {
   // 状态变量
   const [speak, setSpeak] = useState(false);
-  // const [recognizedText, setRecognizedText] = useState(""); // Removed state as it's now part of conversation
-  const [response, setResponse] = useState(""); // Maybe remove this too if only relying on conversation state
+  const [response, setResponse] = useState("");
   const [playing, setPlaying] = useState(false);
   const [backendStatus, setBackendStatus] = useState("正在连接...");
   const [animReady, setAnimReady] = useState(false);
@@ -551,11 +571,22 @@ function App() {
   const [loadingStatus, setLoadingStatus] = useState("");
   const [conversation, setConversation] = useState([]);
   const [audioElement, setAudioElement] = useState(null);
+  const [wsReady, setWsReady] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
 
-  // const conversationRef = useRef(null); // Not needed if only showing last message
+  // 保存处理中的任务
+  const processingTaskRef = useRef(null);
 
-  // 停止录音并发送到服务器
-  const stopRecording = async () => {
+  // 优化: 减少对话历史的最大长度，以提高性能
+  useEffect(() => {
+    if (conversation.length > 10) {
+      // 保留最新的10条消息
+      setConversation(prev => prev.slice(prev.length - 10));
+    }
+  }, [conversation]);
+
+  // 优化: 使用useCallback减少不必要的重渲染
+  const stopRecording = useCallback(async () => {
     if (!mediaRecorder) return;
 
     return new Promise((resolve) => {
@@ -564,6 +595,7 @@ function App() {
         setIsRecording(false);
         setRecordingStatus("处理录音...");
         setLoadingStatus("正在处理语音...");
+        setIsLoading(true);
 
         const audioBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
         console.log("录音文件大小:", audioBlob.size, "字节", "类型:", audioBlob.type);
@@ -580,6 +612,7 @@ function App() {
         } catch (error) {
           console.error("处理音频时出错:", error);
           setLoadingStatus(`处理音频失败: ${error.message}`);
+          setIsLoading(false);
         }
 
         resolve();
@@ -587,10 +620,10 @@ function App() {
 
       mediaRecorder.stop();
     });
-  };
+  }, []);
 
   // 通过WebSocket发送音频
-  const sendAudioViaWebSocket = (audioBlob) => {
+  const sendAudioViaWebSocket = useCallback((audioBlob) => {
     console.log("通过WebSocket发送音频");
 
     // 创建表单数据
@@ -609,10 +642,10 @@ function App() {
     };
 
     reader.readAsDataURL(audioBlob);
-  };
+  }, []);
 
   // 通过HTTP发送音频
-  const sendAudioViaHttp = async (audioBlob) => {
+  const sendAudioViaHttp = useCallback(async (audioBlob) => {
     console.log("通过HTTP API发送音频");
 
     const formData = new FormData();
@@ -638,16 +671,38 @@ function App() {
         setLoadingStatus("开始处理识别到的文本");
       } else {
         setLoadingStatus("语音识别失败");
+        setIsLoading(false);
       }
     } catch (error) {
       console.error("发送音频失败:", error);
       setLoadingStatus(`发送音频失败: ${error.message}`);
+      setIsLoading(false);
     }
-  };
+  }, []);
+
+  // 优化: 取消进行中的任务
+  const cancelProcessingTask = useCallback(() => {
+    if (processingTaskRef.current) {
+      clearTimeout(processingTaskRef.current);
+      processingTaskRef.current = null;
+    }
+    
+    // 停止当前播放的音频
+    if (audioElement) {
+      audioElement.pause();
+      audioElement.currentTime = 0;
+    }
+    
+    // 重置状态
+    setPlaying(false);
+    setAnimationData(null);
+    setIsLoading(false);
+    setLoadingStatus("");
+  }, [audioElement]);
 
   // 初始化WebSocket
   useEffect(() => {
-    setupWebSocket(setBackendStatus);
+    const ws = setupWebSocket(setBackendStatus, setWsReady);
   }, []);
 
   // 初始化麦克风
@@ -677,6 +732,7 @@ function App() {
 
           if (message.type === "processing_complete") {
             console.log("处理完成，获取Blendshape数据和音频");
+            setIsLoading(false);
 
             // 确保音频URL是完整路径
             let audioPath = message.filename;
@@ -725,9 +781,7 @@ function App() {
           else if (message.type === "ai_response") {
             console.log("收到AI响应:", message.text);
             if (message.text) {
-               setResponse(message.text); // Update response for Avatar
-              // Update conversation history (optional, might be redundant if processing_complete also adds it)
-              // setConversation(prev => [...prev, { role: 'assistant', content: message.text }]);
+              setResponse(message.text); // Update response for Avatar
             }
           }
           else if (message.type === "speech_recognition_result") {
@@ -741,16 +795,23 @@ function App() {
               setLoadingStatus("识别完成，等待回复...");
             } else {
               setLoadingStatus("语音识别结果为空");
+              setIsLoading(false);
             }
+          }
+          else if (message.type === "processing_status") {
+            // 新增: 处理状态更新
+            setLoadingStatus(message.message || `正在${message.status}...`);
           }
           else if (message.type === "error") {
             console.error("WebSocket错误:", message.message);
             alert(`处理时出错: ${message.message}`);
             setLoadingStatus("");
+            setIsLoading(false);
           }
         } catch (error) {
           console.error("解析WebSocket消息时出错:", error);
           setLoadingStatus("");
+          setIsLoading(false);
         }
       };
     }
@@ -763,7 +824,7 @@ function App() {
         if(response.ok) {
           setBackendStatus("REST API已连接");
           // 如果REST API可用，尝试连接WebSocket
-          setupWebSocket(setBackendStatus);
+          setupWebSocket(setBackendStatus, setWsReady);
         } else {
           setBackendStatus("后端服务连接失败");
         }
@@ -775,7 +836,13 @@ function App() {
   }, []);
 
   // 处理录音按钮点击
-  const handleRecordClick = async () => {
+  const handleRecordClick = useCallback(async () => {
+    // 如果当前正在加载或播放，则取消当前任务
+    if (isLoading || playing) {
+      cancelProcessingTask();
+      return;
+    }
+    
     if (isRecording) {
       // 停止录音
       await stopRecording();
@@ -794,43 +861,42 @@ function App() {
         }
       }
     }
-  };
+  }, [isRecording, micStream, stopRecording, isLoading, playing, cancelProcessingTask]);
 
   // Get the last message for display
   const lastMessage = conversation.length > 0 ? conversation[conversation.length - 1] : null;
+
+  // 计算麦克风按钮文本
+  const getMicButtonText = useCallback(() => {
+    if (isRecording) return '■';
+    if (isLoading || playing) return '✕';
+    return '🎤';
+  }, [isRecording, isLoading, playing]);
 
   return (
     <div style={STYLES.container}>
       {/* 对话历史 (显示最后一条) */}
       {lastMessage && (
         <div style={STYLES.conversationBox}>
-            <div
-              style={lastMessage.role === 'user' ? STYLES.userBubble : STYLES.aiBubble}
-            >
-              {lastMessage.content}
-            </div>
+          <div
+            style={lastMessage.role === 'user' ? STYLES.userBubble : STYLES.aiBubble}
+          >
+            {lastMessage.content}
+          </div>
         </div>
       )}
 
       {/* 语音输入区域 */}
       <div style={STYLES.speechArea}>
-        {/* Transcript text display is removed */}
-        {/* {recognizedText && (
-          <div style={STYLES.transcriptText}>
-            {recognizedText}
-          </div>
-        )} */}
-
         <button
           onClick={handleRecordClick}
           style={{
             ...STYLES.recordButton,
             ...(isRecording ? STYLES.recordingButton : {})
           }}
-          disabled={loadingStatus.includes("处理中") || loadingStatus.includes("等待")}
         >
           <span style={STYLES.micIcon}>
-            {isRecording ? '■' : '🎤'}
+            {getMicButtonText()}
           </span>
         </button>
 
@@ -839,9 +905,16 @@ function App() {
         </div>
       </div>
 
+      {/* 加载覆盖层 */}
+      {isLoading && (
+        <div style={STYLES.loadingOverlay}>
+          <div style={STYLES.loadingSpinner}></div>
+        </div>
+      )}
+
       {/* 状态栏 */}
       <div style={STYLES.statusBar}>
-        {backendStatus} | 动画: {animReady ? '已加载' : '无'} | {micStatus}
+        {backendStatus} | {wsReady ? 'WebSocket已连接' : 'HTTP模式'} | 动画: {animReady ? '已加载' : '无'} | {micStatus}
       </div>
 
       <Canvas dpr={2} onCreated={(ctx) => {
@@ -849,9 +922,9 @@ function App() {
         }}>
 
         <OrthographicCamera
-        makeDefault
-        zoom={2000}
-        position={[0, 1.65, 1]}
+          makeDefault
+          zoom={2000}
+          position={[0, 1.65, 1]}
         />
 
         <Suspense fallback={null}>
@@ -863,23 +936,30 @@ function App() {
         </Suspense>
 
         <Suspense fallback={null}>
-            <Avatar
-              avatar_url="/model.glb"
-              speak={speak}
-              setSpeak={setSpeak}
-              // text={recognizedText} // Pass response instead, or let Avatar derive from conversation if needed
-              text = {response} // Pass the AI's response text to Avatar for lip sync trigger
-              playing={playing}
-              setPlaying={setPlaying}
-              setResponse={setResponse} // Pass setter if Avatar modifies it
-              setAnimReady={setAnimReady}
-              animationData={animationData}
-              setAudioElement={setAudioElement}
-              />
+          <Avatar
+            avatar_url="/model.glb"
+            speak={speak}
+            setSpeak={setSpeak}
+            text={response}
+            playing={playing}
+            setPlaying={setPlaying}
+            setResponse={setResponse}
+            setAnimReady={setAnimReady}
+            animationData={animationData}
+            setAudioElement={setAudioElement}
+          />
         </Suspense>
 
       </Canvas>
       <Loader dataInterpolation={(p) => `加载中... ${Math.round(p * 100)}%`} />
+      
+      {/* CSS Animations */}
+      <style>{`
+        @keyframes spin {
+          0% { transform: rotate(0deg); }
+          100% { transform: rotate(360deg); }
+        }
+      `}</style>
     </div>
   )
 }

@@ -19,6 +19,7 @@ from typing import List, Dict, Optional
 import uuid
 import subprocess
 import tempfile
+import time
 
 # 设置路径
 COSYVOICE_PATH = "/home/zentek/Documents/CosyVoice"
@@ -37,9 +38,9 @@ for path in [COSYVOICE_PATH, MATCHA_TTS_PATH, AUDIO2FACE_SAMPLES_PATH]:
 from chat_digital_human_lib import (
     load_cosyvoice_model, 
     get_consistent_reference_audio, 
-    text_to_speech_cosyvoice,
     clean_text,
-    get_ai_response
+    get_ai_response,
+    text_to_speech_optimized  # 导入优化的TTS函数
 )
 from audio2face3d_client import Audio2Face3DClient
 
@@ -127,7 +128,6 @@ async def startup_event():
         logger.info("CosyVoice模型加载成功")
         # 预加载参考音频
         reference_audio = get_consistent_reference_audio(cosyvoice_model, AUDIO_DIR)
-        # 修改这里：不要直接检查tensor，而是检查reference_audio是否为None
         if reference_audio is not None:
             logger.info("参考音频加载成功")
         else:
@@ -153,9 +153,96 @@ async def startup_event():
         logger.error(f"Riva ASR客户端初始化失败: {e}")
         riva_asr = None
 
+# 异步获取AI响应和音频
+async def process_ai_response(text, client_id):
+    global cosyvoice_model, audio2face_client, reference_audio
+    
+    start_time = time.time()
+    
+    # 1. 获取AI响应
+    ai_response_task = asyncio.create_task(get_ai_response(text))
+    
+    # 通知前端正在处理
+    if client_id:
+        await manager.send_message(client_id, {
+            "type": "processing_status",
+            "status": "getting_ai_response",
+            "message": "正在获取AI响应..."
+        })
+    
+    # 等待AI响应
+    ai_response = await ai_response_task
+    ai_time = time.time() - start_time
+    logger.info(f"AI响应耗时: {ai_time:.2f}秒")
+    
+    # 通知前端AI响应已准备好
+    if client_id:
+        await manager.send_message(client_id, {
+            "type": "ai_response",
+            "text": ai_response
+        })
+    
+    # 2. 开始语音生成
+    if client_id:
+        await manager.send_message(client_id, {
+            "type": "processing_status",
+            "status": "generating_speech",
+            "message": "正在生成语音..."
+        })
+    
+    # 使用优化的TTS函数
+    tts_start = time.time()
+    audio_samples, audio_file_path = await text_to_speech_optimized(
+        ai_response, 
+        cosyvoice_model, 
+        reference_audio,
+        AUDIO_DIR
+    )
+    tts_time = time.time() - tts_start
+    
+    if not audio_file_path:
+        logger.error("语音合成失败")
+        return None, None, ai_response
+    
+    logger.info(f"语音合成成功: {audio_file_path}, 耗时: {tts_time:.2f}秒")
+    
+    # 通知前端音频准备好了
+    if client_id:
+        await manager.send_message(client_id, {
+            "type": "audio_ready",
+            "path": f"/audio/{os.path.basename(audio_file_path)}"
+        })
+    
+    # 3. 生成Blendshape数据
+    if client_id:
+        await manager.send_message(client_id, {
+            "type": "processing_status",
+            "status": "generating_blendshape",
+            "message": "正在生成面部动画..."
+        })
+    
+    blendshape_start = time.time()
+    csv_path = await process_audio_to_blendshape(audio_file_path, audio2face_client)
+    blendshape_time = time.time() - blendshape_start
+    
+    if not csv_path:
+        logger.error("Blendshape数据生成失败")
+        return audio_file_path, None, ai_response
+    
+    logger.info(f"Blendshape数据生成成功: {csv_path}, 耗时: {blendshape_time:.2f}秒")
+    
+    # 转换Blendshape数据为前端所需格式
+    blend_data = convert_csv_to_blend_data(csv_path)
+    
+    # 记录总处理时间
+    total_time = time.time() - start_time
+    logger.info(f"总处理时间: {total_time:.2f}秒 (AI: {ai_time:.2f}秒, TTS: {tts_time:.2f}秒, Blendshape: {blendshape_time:.2f}秒)")
+    
+    return audio_file_path, blend_data, ai_response
+
 @app.post("/talk")
 async def talk(request: TalkRequest):
-    global cosyvoice_model, audio2face_client, reference_audio
+    global cosyvoice_model, audio2face_client
     
     if not cosyvoice_model or not audio2face_client:
         logger.error("模型未加载，无法处理请求")
@@ -164,54 +251,20 @@ async def talk(request: TalkRequest):
     try:
         logger.info(f"处理文本到语音请求: {request.text[:50]}...")
         
-        # 获取AI响应
-        ai_response = await get_ai_response(request.text)
-        
-        # 如果提供了client_id，通过WebSocket发送AI响应通知
-        if request.client_id:
-            await manager.send_message(request.client_id, {
-                "type": "ai_response",
-                "text": ai_response
-            })
-        
-        # 生成语音
-        audio_samples, audio_file_path = await text_to_speech_cosyvoice(
-            ai_response, 
-            cosyvoice_model, 
-            reference_audio,
-            AUDIO_DIR
+        # 处理AI响应和音频生成
+        audio_file_path, blend_data, ai_response = await process_ai_response(
+            request.text, 
+            request.client_id
         )
         
         if not audio_file_path:
-            logger.error("语音合成失败")
-            return {"error": "语音合成失败"}
-        
-        logger.info(f"语音合成成功: {audio_file_path}")
-        
-        # 如果提供了client_id，通过WebSocket发送语音生成通知
-        if request.client_id:
-            await manager.send_message(request.client_id, {
-                "type": "audio_ready",
-                "path": f"/audio/{os.path.basename(audio_file_path)}"
-            })
-        
-        # 生成Blendshape数据
-        csv_path = await process_audio_to_blendshape(audio_file_path, audio2face_client)
-        
-        if not csv_path:
-            logger.error("Blendshape数据生成失败")
-            return {"error": "Blendshape数据生成失败"}
-        
-        logger.info(f"Blendshape数据生成成功: {csv_path}")
-        
-        # 转换Blendshape数据为前端所需格式
-        blend_data = convert_csv_to_blend_data(csv_path)
+            return {"error": "语音合成或面部动画生成失败"}
         
         # 构建响应
         audio_filename = os.path.basename(audio_file_path)
         audio_url = f"/audio/{audio_filename}"
         
-        logger.info(f"返回响应，音频URL: {audio_url}, Blendshape数据帧数: {len(blend_data)}")
+        logger.info(f"返回响应，音频URL: {audio_url}, Blendshape数据帧数: {len(blend_data) if blend_data else 0}")
         
         # 如果提供了client_id，通过WebSocket发送完成通知
         if request.client_id:
@@ -238,24 +291,49 @@ async def talk(request: TalkRequest):
             })
         return {"error": str(e)}
 
-# 将任意音频转换为WAV格式 (使用ffmpeg)
-async def convert_to_wav(input_path, output_path=None):
+# 优化: 快速转换音频格式，减少临时文件IO
+async def convert_to_wav(input_data, is_file_path=True, output_path=None):
     """将任意音频转换为WAV格式 (16kHz, 16bit, mono)"""
-    if output_path is None:
-        output_path = os.path.splitext(input_path)[0] + ".wav"
-    
     try:
-        # 使用ffmpeg转换音频为WAV格式 (16kHz, 16bit, mono)
-        cmd = [
-            "ffmpeg",
-            "-y",  # 覆盖输出文件
-            "-i", input_path,
-            "-acodec", "pcm_s16le",  # 设置音频编码为16位PCM
-            "-ac", "1",              # 设置为单声道
-            "-ar", "16000",          # 设置采样率为16kHz
-            output_path
-        ]
+        if is_file_path:
+            input_path = input_data
+            if output_path is None:
+                output_path = os.path.splitext(input_path)[0] + ".wav"
+                
+            # 使用ffmpeg转换音频
+            cmd = [
+                "ffmpeg",
+                "-y",  # 覆盖输出文件
+                "-i", input_path,
+                "-acodec", "pcm_s16le",  # 设置音频编码为16位PCM
+                "-ac", "1",              # 设置为单声道
+                "-ar", "16000",          # 设置采样率为16kHz
+                output_path
+            ]
+        else:
+            # 处理内存中的音频数据
+            if output_path is None:
+                # 创建临时文件
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+                    output_path = temp_file.name
+            
+            # 创建临时输入文件
+            with tempfile.NamedTemporaryFile(suffix='.webm', delete=False) as temp_input:
+                temp_input_path = temp_input.name
+                temp_input.write(input_data)
+            
+            # 使用ffmpeg转换音频
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i", temp_input_path,
+                "-acodec", "pcm_s16le",
+                "-ac", "1",
+                "-ar", "16000",
+                output_path
+            ]
         
+        # 执行转换命令
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -263,6 +341,10 @@ async def convert_to_wav(input_path, output_path=None):
         )
         
         stdout, stderr = await process.communicate()
+        
+        # 清理临时文件
+        if not is_file_path and os.path.exists(temp_input_path):
+            os.remove(temp_input_path)
         
         if process.returncode != 0:
             logger.error(f"转换音频格式失败: {stderr.decode()}")
@@ -274,6 +356,7 @@ async def convert_to_wav(input_path, output_path=None):
         logger.error(f"转换音频格式时出错: {e}")
         return None
 
+# 优化: ASR处理加速
 @app.post("/recognize_speech")
 async def recognize_speech(
     audio: UploadFile = File(...),
@@ -290,32 +373,25 @@ async def recognize_speech(
     try:
         logger.info(f"接收到语音识别请求，客户端ID: {client_id}, 音频格式: {audio_format}")
         
-        # 保存上传的原始音频文件
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        temp_audio_path = os.path.join(TEMP_DIR, f"original_speech_{timestamp}")
-        
-        # 根据格式添加适当的扩展名
-        if "webm" in audio_format:
-            temp_audio_path += ".webm"
-        elif "mp3" in audio_format:
-            temp_audio_path += ".mp3"
-        elif "wav" in audio_format:
-            temp_audio_path += ".wav"
-        else:
-            temp_audio_path += ".audio"  # 默认扩展名
+        start_time = time.time()
         
         # 读取上传的音频内容
         content = await audio.read()
         
-        # 写入临时音频文件
-        with open(temp_audio_path, "wb") as f:
-            f.write(content)
+        # 通知前端开始处理
+        if client_id:
+            await manager.send_message(client_id, {
+                "type": "processing_status",
+                "status": "processing_speech",
+                "message": "正在处理语音..."
+            })
         
-        logger.info(f"临时原始音频文件已保存: {temp_audio_path}")
-        
-        # 转换为WAV格式 (16kHz, 16bit, mono) - Riva需要
+        # 创建临时WAV文件
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         temp_wav_path = os.path.join(TEMP_DIR, f"speech_input_{timestamp}.wav")
-        converted_wav_path = await convert_to_wav(temp_audio_path, temp_wav_path)
+        
+        # 直接从内存转换音频
+        converted_wav_path = await convert_to_wav(content, is_file_path=False, output_path=temp_wav_path)
         
         if not converted_wav_path or not os.path.exists(converted_wav_path):
             logger.error("音频格式转换失败")
@@ -330,14 +406,22 @@ async def recognize_speech(
         with open(converted_wav_path, "rb") as f:
             wav_content = f.read()
         
+        # 通知前端正在进行语音识别
+        if client_id:
+            await manager.send_message(client_id, {
+                "type": "processing_status",
+                "status": "speech_recognition",
+                "message": "正在进行语音识别..."
+            })
+        
         # 配置Riva识别参数
         config = riva.client.RecognitionConfig()
-        config.encoding = riva.client.AudioEncoding.LINEAR_PCM  # 明确指定音频编码格式
+        config.encoding = riva.client.AudioEncoding.LINEAR_PCM
         config.language_code = "zh-CN"
         config.max_alternatives = 1
         config.enable_automatic_punctuation = True
         config.audio_channel_count = 1
-        config.sample_rate_hertz = 16000  # 明确指定采样率
+        config.sample_rate_hertz = 16000
         
         # 进行语音识别
         response = await asyncio.to_thread(
@@ -351,7 +435,11 @@ async def recognize_speech(
             transcript = response.results[0].alternatives[0].transcript
             logger.info(f"语音识别结果: {transcript}")
             
-            # 通过WebSocket发送结果（如果提供了client_id）
+            # 记录处理时间
+            recognition_time = time.time() - start_time
+            logger.info(f"语音识别处理时间: {recognition_time:.2f}秒")
+            
+            # 通过WebSocket发送结果
             if client_id:
                 await manager.send_message(client_id, {
                     "type": "speech_recognition_result",
@@ -362,7 +450,6 @@ async def recognize_speech(
                 if transcript:
                     logger.info(f"自动提交识别文本到AI处理: {transcript}")
                     talk_request = TalkRequest(text=transcript, client_id=client_id)
-                    # 创建一个异步任务来处理请求
                     asyncio.create_task(talk(talk_request))
             
             return {"text": transcript, "success": True}
@@ -376,7 +463,7 @@ async def recognize_speech(
                 })
                 
             return {"error": "语音识别失败，没有结果", "success": False}
-    
+                
     except Exception as e:
         logger.error(f"语音识别处理错误: {e}")
         traceback.print_exc()
@@ -391,8 +478,6 @@ async def recognize_speech(
     finally:
         # 清理临时文件
         try:
-            if os.path.exists(temp_audio_path):
-                os.remove(temp_audio_path)
             if os.path.exists(temp_wav_path):
                 os.remove(temp_wav_path)
         except Exception as e:
@@ -440,7 +525,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             talk(TalkRequest(text=text, client_id=client_id))
                         )
                         await manager.send_message(client_id, {
-                            "type": "processing_started",
+                            "type": "processing_status",
+                            "status": "started",
                             "message": "开始处理请求"
                         })
                     else:
@@ -458,7 +544,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             process_audio_data(audio_data, audio_format, client_id)
                         )
                         await manager.send_message(client_id, {
-                            "type": "processing_started",
+                            "type": "processing_status",
+                            "status": "started",
                             "message": "开始处理语音识别"
                         })
                     else:
@@ -484,6 +571,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         logger.error(f"WebSocket连接错误: {str(e)}")
         manager.disconnect(client_id)
 
+# 优化: 简化音频处理流程
 async def process_audio_data(base64_audio, audio_format, client_id):
     """处理Base64编码的音频数据"""
     global riva_asr
@@ -497,32 +585,24 @@ async def process_audio_data(base64_audio, audio_format, client_id):
         return
     
     try:
+        start_time = time.time()
+        
         # 从Base64解码音频数据
         audio_data = base64.b64decode(base64_audio)
         
-        # 保存为临时音频文件
+        # 通知前端开始处理
+        await manager.send_message(client_id, {
+            "type": "processing_status",
+            "status": "processing_speech",
+            "message": "正在处理语音..."
+        })
+        
+        # 创建临时WAV文件
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        temp_audio_path = os.path.join(TEMP_DIR, f"websocket_speech_{timestamp}")
-        
-        # 添加适当的扩展名
-        if "webm" in audio_format:
-            temp_audio_path += ".webm"
-        elif "mp3" in audio_format:
-            temp_audio_path += ".mp3"
-        elif "wav" in audio_format:
-            temp_audio_path += ".wav"
-        else:
-            temp_audio_path += ".audio"  # 默认扩展名
-        
-        # 将音频数据写入临时文件
-        with open(temp_audio_path, "wb") as f:
-            f.write(audio_data)
-        
-        logger.info(f"临时原始音频文件已保存: {temp_audio_path}")
-        
-        # 转换为WAV格式
         temp_wav_path = os.path.join(TEMP_DIR, f"websocket_converted_{timestamp}.wav")
-        converted_wav_path = await convert_to_wav(temp_audio_path, temp_wav_path)
+        
+        # 直接从内存转换音频
+        converted_wav_path = await convert_to_wav(audio_data, is_file_path=False, output_path=temp_wav_path)
         
         if not converted_wav_path or not os.path.exists(converted_wav_path):
             logger.error("音频格式转换失败")
@@ -536,14 +616,21 @@ async def process_audio_data(base64_audio, audio_format, client_id):
         with open(converted_wav_path, "rb") as f:
             wav_content = f.read()
         
+        # 通知前端正在进行语音识别
+        await manager.send_message(client_id, {
+            "type": "processing_status",
+            "status": "speech_recognition",
+            "message": "正在进行语音识别..."
+        })
+        
         # 配置Riva识别参数
         config = riva.client.RecognitionConfig()
-        config.encoding = riva.client.AudioEncoding.LINEAR_PCM  # 明确指定音频编码格式
+        config.encoding = riva.client.AudioEncoding.LINEAR_PCM
         config.language_code = "zh-CN"
         config.max_alternatives = 1
         config.enable_automatic_punctuation = True
         config.audio_channel_count = 1
-        config.sample_rate_hertz = 16000  # 明确指定采样率
+        config.sample_rate_hertz = 16000
         
         # 进行语音识别
         response = await asyncio.to_thread(
@@ -556,6 +643,10 @@ async def process_audio_data(base64_audio, audio_format, client_id):
         if response.results:
             transcript = response.results[0].alternatives[0].transcript
             logger.info(f"语音识别结果: {transcript}")
+            
+            # 记录处理时间
+            recognition_time = time.time() - start_time
+            logger.info(f"WebSocket语音识别处理时间: {recognition_time:.2f}秒")
             
             # 发送识别结果
             await manager.send_message(client_id, {
@@ -586,8 +677,6 @@ async def process_audio_data(base64_audio, audio_format, client_id):
     finally:
         # 清理临时文件
         try:
-            if os.path.exists(temp_audio_path):
-                os.remove(temp_audio_path)
             if os.path.exists(temp_wav_path):
                 os.remove(temp_wav_path)
         except Exception as e:
@@ -732,4 +821,6 @@ def convert_blendshape_name(arkit_name):
 
 if __name__ == "__main__":
     import uvicorn
+    import time
     uvicorn.run(app, host="0.0.0.0", port=5000)
+
