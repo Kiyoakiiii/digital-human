@@ -27,6 +27,7 @@ let clientId = 'client_' + Math.random().toString(36).substr(2, 9);
 let mediaRecorder = null;
 let audioChunks = [];
 
+// 保持Avatar完整实现，不做简化
 function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setResponse, setAnimReady, animationData, setAudioElement }) {
   let gltf = useGLTF(avatar_url);
   let morphTargetDictionaryBody = null;
@@ -147,6 +148,10 @@ function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setRes
         node.material.envMapIntensity = 0.3;
       }
 
+      if (node.name.includes("TeethLower")) {
+        morphTargetDictionaryLowerTeeth = node.morphTargetDictionary;
+      }
+
       if (node.name.includes("TSHIRT")) {
         node.material = new MeshStandardMaterial();
         node.material.map = tshirtDiffuseTexture;
@@ -154,10 +159,6 @@ function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setRes
         node.material.normalMap = tshirtNormalTexture;
         node.material.color.setHex(0xffffff);
         node.material.envMapIntensity = 0.5;
-      }
-
-      if (node.name.includes("TeethLower")) {
-        morphTargetDictionaryLowerTeeth = node.morphTargetDictionary;
       }
     }
   });
@@ -176,30 +177,18 @@ function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setRes
     }
   }, [clips, setAnimReady]);
 
-  // 更新处理动画和音频数据的方法 - 优化性能
+  // 更新处理动画数据
   useEffect(() => {
     if (animationData && animationData.blendData) {
       console.log("处理动画数据，帧数:", animationData.blendData.length);
 
-      // 优化：限制处理的帧数，增加性能
-      const maxFrames = 300; // 限制最大帧数以提高性能
-      let processedData = animationData.blendData;
-      
-      if (animationData.blendData.length > maxFrames) {
-        const skipFactor = Math.ceil(animationData.blendData.length / maxFrames);
-        processedData = animationData.blendData.filter((_, index) => index % skipFactor === 0);
-        console.log(`优化：从 ${animationData.blendData.length} 帧减少到 ${processedData.length} 帧`);
-      }
-
       // 创建动画剪辑
       const newClips = [
-        createAnimation(processedData, morphTargetDictionaryBody, 'HG_Body'),
-        createAnimation(processedData, morphTargetDictionaryLowerTeeth, 'HG_TeethLower')
+        createAnimation(animationData.blendData, morphTargetDictionaryBody, 'HG_Body'),
+        createAnimation(animationData.blendData, morphTargetDictionaryLowerTeeth, 'HG_TeethLower')
       ];
 
       console.log("动画剪辑已创建:", newClips.map(c => c.tracks.length + "个轨道"));
-
-      // 设置动画剪辑
       setClips(newClips);
     }
   }, [animationData]);
@@ -236,7 +225,7 @@ function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setRes
     blinkAction.play();
   }, []);
 
-  // Play animation clips when available - 优化性能
+  // 播放动画剪辑
   useEffect(() => {
     if (playing === false || !clips || clips.length === 0)
       return;
@@ -302,11 +291,11 @@ function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setRes
   );
 }
 
-// 优化: 使用缓存和重试机制的WebSocket连接
+// WebSocket连接优化
 function setupWebSocket(setBackendStatus, setWsReady) {
   if (websocket && websocket.readyState === WebSocket.OPEN) {
     console.log("WebSocket已连接，不需要重新连接");
-    return websocket; // WebSocket已经连接
+    return websocket;
   }
 
   // 完整的WebSocket URL
@@ -360,17 +349,16 @@ function setupWebSocket(setBackendStatus, setWsReady) {
   }
 }
 
-// 优化: 更高效的麦克风初始化
+// 麦克风初始化
 async function setupMicrophone(setMicStatus) {
   try {
-    // 优化: 更高效的音频配置
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
         noiseSuppression: true,
         autoGainControl: true,
-        sampleRate: 16000,    // 设置采样率为16kHz
-        channelCount: 1       // 单声道
+        sampleRate: 16000,
+        channelCount: 1
       }
     });
     setMicStatus("麦克风已准备就绪");
@@ -382,16 +370,16 @@ async function setupMicrophone(setMicStatus) {
   }
 }
 
-// 优化: 更高效的录音配置
+// 录音配置
 function startRecording(stream, setIsRecording, setRecordingStatus) {
   if (!stream) return;
 
   audioChunks = [];
 
-  // 配置MediaRecorder，强制使用合适的编码
+  // 配置MediaRecorder
   const options = {
-    mimeType: 'audio/webm',  // 更改为webm格式
-    audioBitsPerSecond: 16000 // 16kHz采样率
+    mimeType: 'audio/webm',
+    audioBitsPerSecond: 16000
   };
 
   try {
@@ -399,7 +387,6 @@ function startRecording(stream, setIsRecording, setRecordingStatus) {
   } catch (e) {
     console.warn("WebM格式不支持，尝试使用替代格式");
     try {
-      // 尝试备用格式
       mediaRecorder = new MediaRecorder(stream);
     } catch (e2) {
       console.error("无法创建MediaRecorder:", e2);
@@ -429,12 +416,12 @@ function startRecording(stream, setIsRecording, setRecordingStatus) {
   // 每100ms保存一次数据，提高响应速度
   mediaRecorder.start(100);
 
-  // 设置自动停止录音的计时器 (最长录音时间，例如8秒)
+  // 设置自动停止录音的计时器 (8秒)
   setTimeout(() => {
     if (mediaRecorder && mediaRecorder.state === "recording") {
       mediaRecorder.stop();
     }
-  }, 8000);  // 减少最大录音时间以提高响应速度
+  }, 8000);
 }
 
 const STYLES = {
@@ -532,27 +519,6 @@ const STYLES = {
   },
   hidden: {
     display: 'none'
-  },
-  loadingOverlay: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    backgroundColor: 'rgba(0, 0, 0, 0.3)',
-    display: 'flex',
-    justifyContent: 'center',
-    alignItems: 'center',
-    zIndex: 1000,
-    pointerEvents: 'none'
-  },
-  loadingSpinner: {
-    width: '50px',
-    height: '50px',
-    border: '5px solid rgba(255, 255, 255, 0.3)',
-    borderRadius: '50%',
-    borderTop: '5px solid white',
-    animation: 'spin 1s linear infinite'
   }
 };
 
@@ -568,24 +534,22 @@ function App() {
   const [micStatus, setMicStatus] = useState("正在初始化麦克风...");
   const [isRecording, setIsRecording] = useState(false);
   const [recordingStatus, setRecordingStatus] = useState("点击麦克风按钮开始录音");
-  const [loadingStatus, setLoadingStatus] = useState("");
+  const [statusMessage, setStatusMessage] = useState("");
   const [conversation, setConversation] = useState([]);
   const [audioElement, setAudioElement] = useState(null);
   const [wsReady, setWsReady] = useState(false);
-  const [isLoading, setIsLoading] = useState(false);
 
   // 保存处理中的任务
   const processingTaskRef = useRef(null);
 
-  // 优化: 减少对话历史的最大长度，以提高性能
+  // 限制对话历史长度
   useEffect(() => {
     if (conversation.length > 10) {
-      // 保留最新的10条消息
       setConversation(prev => prev.slice(prev.length - 10));
     }
   }, [conversation]);
 
-  // 优化: 使用useCallback减少不必要的重渲染
+  // 停止录音
   const stopRecording = useCallback(async () => {
     if (!mediaRecorder) return;
 
@@ -594,8 +558,7 @@ function App() {
         console.log("录音已完成，处理中...");
         setIsRecording(false);
         setRecordingStatus("处理录音...");
-        setLoadingStatus("正在处理语音...");
-        setIsLoading(true);
+        setStatusMessage("正在处理语音...");
 
         const audioBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
         console.log("录音文件大小:", audioBlob.size, "字节", "类型:", audioBlob.type);
@@ -611,8 +574,7 @@ function App() {
           }
         } catch (error) {
           console.error("处理音频时出错:", error);
-          setLoadingStatus(`处理音频失败: ${error.message}`);
-          setIsLoading(false);
+          setStatusMessage(`处理音频失败: ${error.message}`);
         }
 
         resolve();
@@ -638,7 +600,7 @@ function App() {
         client_id: clientId
       }));
 
-      setLoadingStatus("语音识别中...");
+      setStatusMessage("语音识别中...");
     };
 
     reader.readAsDataURL(audioBlob);
@@ -654,7 +616,7 @@ function App() {
     formData.append('audio_format', audioBlob.type || "audio/webm");
 
     try {
-      setLoadingStatus("发送音频到服务器...");
+      setStatusMessage("发送音频到服务器...");
       const response = await axios.post(`${host}/recognize_speech`, formData, {
         headers: {
           'Content-Type': 'multipart/form-data'
@@ -668,19 +630,17 @@ function App() {
           role: 'user',
           content: response.data.text
         }]);
-        setLoadingStatus("开始处理识别到的文本");
+        setStatusMessage("开始处理识别到的文本");
       } else {
-        setLoadingStatus("语音识别失败");
-        setIsLoading(false);
+        setStatusMessage("语音识别失败");
       }
     } catch (error) {
       console.error("发送音频失败:", error);
-      setLoadingStatus(`发送音频失败: ${error.message}`);
-      setIsLoading(false);
+      setStatusMessage(`发送音频失败: ${error.message}`);
     }
   }, []);
 
-  // 优化: 取消进行中的任务
+  // 取消进行中的任务
   const cancelProcessingTask = useCallback(() => {
     if (processingTaskRef.current) {
       clearTimeout(processingTaskRef.current);
@@ -696,8 +656,7 @@ function App() {
     // 重置状态
     setPlaying(false);
     setAnimationData(null);
-    setIsLoading(false);
-    setLoadingStatus("");
+    setStatusMessage("");
   }, [audioElement]);
 
   // 初始化WebSocket
@@ -732,7 +691,6 @@ function App() {
 
           if (message.type === "processing_complete") {
             console.log("处理完成，获取Blendshape数据和音频");
-            setIsLoading(false);
 
             // 确保音频URL是完整路径
             let audioPath = message.filename;
@@ -767,7 +725,7 @@ function App() {
             setAudioElement(audio);
 
             if (message.text) {
-              setResponse(message.text); // You might still need this for the Avatar if it uses it directly
+              setResponse(message.text);
               // 添加到对话历史
               setConversation(prev => [...prev, {
                 role: 'assistant',
@@ -775,13 +733,13 @@ function App() {
               }]);
             }
 
-            // 重置加载状态
-            setLoadingStatus("");
+            // 重置状态消息
+            setStatusMessage("");
           }
           else if (message.type === "ai_response") {
             console.log("收到AI响应:", message.text);
             if (message.text) {
-              setResponse(message.text); // Update response for Avatar
+              setResponse(message.text);
             }
           }
           else if (message.type === "speech_recognition_result") {
@@ -792,26 +750,23 @@ function App() {
                 role: 'user',
                 content: message.text
               }]);
-              setLoadingStatus("识别完成，等待回复...");
+              setStatusMessage("识别完成，等待回复...");
             } else {
-              setLoadingStatus("语音识别结果为空");
-              setIsLoading(false);
+              setStatusMessage("语音识别结果为空");
             }
           }
           else if (message.type === "processing_status") {
-            // 新增: 处理状态更新
-            setLoadingStatus(message.message || `正在${message.status}...`);
+            // 处理状态更新
+            setStatusMessage(message.message || `正在${message.status}...`);
           }
           else if (message.type === "error") {
             console.error("WebSocket错误:", message.message);
             alert(`处理时出错: ${message.message}`);
-            setLoadingStatus("");
-            setIsLoading(false);
+            setStatusMessage("");
           }
         } catch (error) {
           console.error("解析WebSocket消息时出错:", error);
-          setLoadingStatus("");
-          setIsLoading(false);
+          setStatusMessage("");
         }
       };
     }
@@ -837,8 +792,8 @@ function App() {
 
   // 处理录音按钮点击
   const handleRecordClick = useCallback(async () => {
-    // 如果当前正在加载或播放，则取消当前任务
-    if (isLoading || playing) {
+    // 如果当前正在播放，则取消当前任务
+    if (playing) {
       cancelProcessingTask();
       return;
     }
@@ -861,17 +816,17 @@ function App() {
         }
       }
     }
-  }, [isRecording, micStream, stopRecording, isLoading, playing, cancelProcessingTask]);
+  }, [isRecording, micStream, stopRecording, playing, cancelProcessingTask]);
 
-  // Get the last message for display
+  // 获取最后一条消息用于显示
   const lastMessage = conversation.length > 0 ? conversation[conversation.length - 1] : null;
 
   // 计算麦克风按钮文本
   const getMicButtonText = useCallback(() => {
     if (isRecording) return '■';
-    if (isLoading || playing) return '✕';
+    if (playing) return '✕';
     return '🎤';
-  }, [isRecording, isLoading, playing]);
+  }, [isRecording, playing]);
 
   return (
     <div style={STYLES.container}>
@@ -901,16 +856,9 @@ function App() {
         </button>
 
         <div style={STYLES.statusText}>
-          {isRecording ? '正在录音...' : (loadingStatus || '点击麦克风开始语音输入')}
+          {isRecording ? '正在录音...' : (statusMessage || '点击麦克风开始语音输入')}
         </div>
       </div>
-
-      {/* 加载覆盖层 */}
-      {isLoading && (
-        <div style={STYLES.loadingOverlay}>
-          <div style={STYLES.loadingSpinner}></div>
-        </div>
-      )}
 
       {/* 状态栏 */}
       <div style={STYLES.statusBar}>
@@ -952,14 +900,6 @@ function App() {
 
       </Canvas>
       <Loader dataInterpolation={(p) => `加载中... ${Math.round(p * 100)}%`} />
-      
-      {/* CSS Animations */}
-      <style>{`
-        @keyframes spin {
-          0% { transform: rotate(0deg); }
-          100% { transform: rotate(360deg); }
-        }
-      `}</style>
     </div>
   )
 }

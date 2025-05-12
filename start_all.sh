@@ -55,6 +55,6 @@ echo "$FRONTEND_PID" > "$PROJECT_DIR/frontend.pid"
 
 echo "服务已启动:"
 echo "- 后端: http://localhost:5000"
-echo "- 前端: https://172.16.10.158:3000"
+echo "- 前端: http://172.16.10.158:3000"
 echo "- 日志: $LOGS_DIR/backend.log 和 $LOGS_DIR/frontend.log"
 echo "要停止服务，请运行 ./stop_all.sh"

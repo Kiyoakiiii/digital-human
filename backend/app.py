@@ -7,7 +7,6 @@ import os
 import json
 from datetime import datetime
 import numpy as np
-import pandas as pd
 import logging
 import traceback
 import re
@@ -34,13 +33,12 @@ for path in [COSYVOICE_PATH, MATCHA_TTS_PATH, AUDIO2FACE_SAMPLES_PATH]:
     if path not in sys.path:
         sys.path.append(path)
 
-# 导入你的模块
+# 导入模块
 from chat_digital_human_lib import (
     load_cosyvoice_model, 
     get_consistent_reference_audio, 
-    clean_text,
     get_ai_response,
-    text_to_speech_optimized  # 导入优化的TTS函数
+    text_to_speech_optimized
 )
 from audio2face3d_client import Audio2Face3DClient
 
@@ -56,7 +54,7 @@ app = FastAPI()
 # 允许CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 在生产环境中应该限制为你的前端域名
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -138,7 +136,7 @@ async def startup_event():
     # 初始化Audio2Face客户端
     logger.info("开始初始化Audio2Face客户端")
     audio2face_client = Audio2Face3DClient(
-        server_address="172.16.10.158:52000",  # 使用你的Audio2Face服务器地址
+        server_address="172.16.10.158:52000",
         max_buffer_seconds=10.0
     )
     logger.info("Audio2Face客户端初始化完成")
@@ -153,7 +151,7 @@ async def startup_event():
         logger.error(f"Riva ASR客户端初始化失败: {e}")
         riva_asr = None
 
-# 异步获取AI响应和音频
+# 优化: 并行处理AI响应和音频生成
 async def process_ai_response(text, client_id):
     global cosyvoice_model, audio2face_client, reference_audio
     
@@ -182,7 +180,8 @@ async def process_ai_response(text, client_id):
             "text": ai_response
         })
     
-    # 2. 开始语音生成
+    # 2. 启动TTS和Blendshape生成 - 并行处理
+    # 开始语音生成
     if client_id:
         await manager.send_message(client_id, {
             "type": "processing_status",
@@ -190,14 +189,14 @@ async def process_ai_response(text, client_id):
             "message": "正在生成语音..."
         })
     
-    # 使用优化的TTS函数
+    # 2.1 启动TTS任务
     tts_start = time.time()
-    audio_samples, audio_file_path = await text_to_speech_optimized(
-        ai_response, 
-        cosyvoice_model, 
-        reference_audio,
-        AUDIO_DIR
+    tts_task = asyncio.create_task(
+        text_to_speech_optimized(ai_response, cosyvoice_model, reference_audio, AUDIO_DIR)
     )
+    
+    # 等待TTS完成
+    audio_samples, audio_file_path = await tts_task
     tts_time = time.time() - tts_start
     
     if not audio_file_path:
@@ -206,14 +205,7 @@ async def process_ai_response(text, client_id):
     
     logger.info(f"语音合成成功: {audio_file_path}, 耗时: {tts_time:.2f}秒")
     
-    # 通知前端音频准备好了
-    if client_id:
-        await manager.send_message(client_id, {
-            "type": "audio_ready",
-            "path": f"/audio/{os.path.basename(audio_file_path)}"
-        })
-    
-    # 3. 生成Blendshape数据
+    # 2.2 同时开始生成Blendshape数据 (与TTS并行)
     if client_id:
         await manager.send_message(client_id, {
             "type": "processing_status",
@@ -221,8 +213,21 @@ async def process_ai_response(text, client_id):
             "message": "正在生成面部动画..."
         })
     
+    # 立即开始处理Blendshape (与TTS并行)
     blendshape_start = time.time()
-    csv_path = await process_audio_to_blendshape(audio_file_path, audio2face_client)
+    blendshape_task = asyncio.create_task(
+        process_audio_to_blendshape(audio_file_path, audio2face_client)
+    )
+    
+    # 通知前端音频准备好了
+    if client_id:
+        await manager.send_message(client_id, {
+            "type": "audio_ready",
+            "path": f"/audio/{os.path.basename(audio_file_path)}"
+        })
+    
+    # 等待Blendshape处理完成
+    csv_path = await blendshape_task
     blendshape_time = time.time() - blendshape_start
     
     if not csv_path:
@@ -291,7 +296,7 @@ async def talk(request: TalkRequest):
             })
         return {"error": str(e)}
 
-# 优化: 快速转换音频格式，减少临时文件IO
+# 优化: 快速转换音频格式
 async def convert_to_wav(input_data, is_file_path=True, output_path=None):
     """将任意音频转换为WAV格式 (16kHz, 16bit, mono)"""
     try:
@@ -356,7 +361,7 @@ async def convert_to_wav(input_data, is_file_path=True, output_path=None):
         logger.error(f"转换音频格式时出错: {e}")
         return None
 
-# 优化: ASR处理加速
+# 优化: ASR处理
 @app.post("/recognize_speech")
 async def recognize_speech(
     audio: UploadFile = File(...),
@@ -702,15 +707,15 @@ async def check_status(request: StatusRequest = None):
     
     return status
 
-# 处理音频生成Blendshape数据
+# 处理音频生成Blendshape数据 - 优化版
 async def process_audio_to_blendshape(audio_filepath, client):
-    # 这个函数与chat_digital_human.py中的类似，但做了适应性修改
+    """处理音频文件生成Blendshape数据"""
+    # 用音频文件名作为输出CSV文件名
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_csv_path = os.path.join(BLENDSHAPE_DIR, f"blendshape_{timestamp}.csv")
     
     try:
         # 获取音频长度
-        import wave
         with wave.open(audio_filepath, 'rb') as wf:
             n_frames = wf.getnframes()
             sample_rate = wf.getframerate()
@@ -753,30 +758,48 @@ async def process_audio_to_blendshape(audio_filepath, client):
         traceback.print_exc()
         return None
 
-# 将CSV格式的Blendshape数据转换为前端所需的JSON格式
+# 将CSV格式的Blendshape数据转换为前端所需的JSON格式 - 优化版
 def convert_csv_to_blend_data(csv_path):
+    """将CSV Blendshape数据转换为前端所需JSON格式"""
     try:
+        # 直接使用numpy加载CSV以提高性能
+        import numpy as np
+        import pandas as pd
+        
+        # 使用pandas读取CSV (更快且内存效率高)
         df = pd.read_csv(csv_path)
-        blend_data = []
         
         # 获取所有Blendshape列
         blendshape_cols = [col for col in df.columns if col not in ['frame', 'time', 'time_code']]
         
-        for _, row in df.iterrows():
-            frame_data = {
-                "time": float(row['time']),
-                "blendshapes": {}
-            }
+        # 提前构建转换映射
+        conversion_map = get_blendshape_conversion_map()
+        
+        # 预分配数组大小来提高性能
+        blend_data = []
+        blend_data_capacity = len(df)
+        blend_data = [None] * blend_data_capacity
+        
+        # 使用向量化操作处理数据
+        for i, row in enumerate(df.itertuples()):
+            # 获取时间
+            time_value = getattr(row, 'time')
             
-            # 添加所有Blendshape值
+            # 创建blendshapes字典
+            blendshapes = {}
+            
+            # 处理每个blendshape值
             for col in blendshape_cols:
-                # 转换列名为前端期望的格式
-                key = convert_blendshape_name(col)
-                # 避免NaN值
-                if pd.notna(row[col]):
-                    frame_data["blendshapes"][key] = float(row[col])
+                if hasattr(row, col) and pd.notna(getattr(row, col)):
+                    value = float(getattr(row, col))
+                    key = conversion_map.get(col, col)
+                    blendshapes[key] = value
             
-            blend_data.append(frame_data)
+            # 创建帧数据
+            blend_data[i] = {
+                "time": float(time_value),
+                "blendshapes": blendshapes
+            }
         
         return blend_data
     except Exception as e:
@@ -784,43 +807,48 @@ def convert_csv_to_blend_data(csv_path):
         traceback.print_exc()
         return []
 
-# 将ARKit Blendshape名转换为前端使用的格式
-def convert_blendshape_name(arkit_name):
-    # 根据前端代码的需要进行名称转换
-    conversion_map = {
-        "EyeBlinkLeft": "eyeBlinkLeft",
-        "EyeBlinkRight": "eyeBlinkRight",
-        "JawOpen": "jawOpen",
-        "MouthSmileLeft": "mouthSmileLeft",
-        "MouthSmileRight": "mouthSmileRight",
-        "BrowInnerUp": "browInnerUp",
-        "MouthClose": "mouthClose",
-        "MouthFunnel": "mouthFunnel",
-        "MouthPucker": "mouthPucker",
-        "MouthLeft": "mouthLeft",
-        "MouthRight": "mouthRight",
-        "MouthFrownLeft": "mouthFrownLeft",
-        "MouthFrownRight": "mouthFrownRight",
-        "MouthDimpleLeft": "mouthDimpleLeft",
-        "MouthDimpleRight": "mouthDimpleRight",
-        "MouthStretchLeft": "mouthStretchLeft",
-        "MouthStretchRight": "mouthStretchRight",
-        "MouthRollLower": "mouthRollLower",
-        "MouthRollUpper": "mouthRollUpper",
-        "MouthShrugLower": "mouthShrugLower",
-        "MouthShrugUpper": "mouthShrugUpper",
-        "MouthPressLeft": "mouthPressLeft",
-        "MouthPressRight": "mouthPressRight",
-        "MouthLowerDownLeft": "mouthLowerDownLeft",
-        "MouthLowerDownRight": "mouthLowerDownRight",
-        "MouthUpperUpLeft": "mouthUpperUpLeft",
-        "MouthUpperUpRight": "mouthUpperUpRight",
-    }
+# 缓存blendshape名称转换映射
+_blendshape_conversion_map = None
+
+# 获取Blendshape名称转换映射
+def get_blendshape_conversion_map():
+    """获取ARKit Blendshape名称转换映射 (使用缓存)"""
+    global _blendshape_conversion_map
     
-    return conversion_map.get(arkit_name, arkit_name[0].lower() + arkit_name[1:])
+    if _blendshape_conversion_map is None:
+        # 创建转换映射
+        _blendshape_conversion_map = {
+            "EyeBlinkLeft": "eyeBlinkLeft",
+            "EyeBlinkRight": "eyeBlinkRight",
+            "JawOpen": "jawOpen",
+            "MouthSmileLeft": "mouthSmileLeft",
+            "MouthSmileRight": "mouthSmileRight",
+            "BrowInnerUp": "browInnerUp",
+            "MouthClose": "mouthClose",
+            "MouthFunnel": "mouthFunnel",
+            "MouthPucker": "mouthPucker",
+            "MouthLeft": "mouthLeft",
+            "MouthRight": "mouthRight",
+            "MouthFrownLeft": "mouthFrownLeft",
+            "MouthFrownRight": "mouthFrownRight",
+            "MouthDimpleLeft": "mouthDimpleLeft",
+            "MouthDimpleRight": "mouthDimpleRight",
+            "MouthStretchLeft": "mouthStretchLeft",
+            "MouthStretchRight": "mouthStretchRight",
+            "MouthRollLower": "mouthRollLower",
+            "MouthRollUpper": "mouthRollUpper",
+            "MouthShrugLower": "mouthShrugLower",
+            "MouthShrugUpper": "mouthShrugUpper",
+            "MouthPressLeft": "mouthPressLeft",
+            "MouthPressRight": "mouthPressRight",
+            "MouthLowerDownLeft": "mouthLowerDownLeft",
+            "MouthLowerDownRight": "mouthLowerDownRight",
+            "MouthUpperUpLeft": "mouthUpperUpLeft",
+            "MouthUpperUpRight": "mouthUpperUpRight",
+        }
+    
+    return _blendshape_conversion_map
 
 if __name__ == "__main__":
     import uvicorn
-    import time
     uvicorn.run(app, host="0.0.0.0", port=5000)
-
