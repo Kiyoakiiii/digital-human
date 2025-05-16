@@ -21,24 +21,24 @@ import tempfile
 import time
 
 # 设置路径
-COSYVOICE_PATH = "/home/zentek/Documents/CosyVoice"
-MATCHA_TTS_PATH = os.path.join(COSYVOICE_PATH, "third_party/Matcha-TTS")
+GPTSOVITS_PATH = "/home/zentek/Documents/GPT-SoVITS"
+GPTSOVITS_MODULE_PATH = os.path.join(GPTSOVITS_PATH, "GPT_SoVITS")
 AUDIO2FACE_SAMPLES_PATH = "/home/zentek/Documents/Audio2Face-3D-Samples"
 AUDIO_DIR = "/home/zentek/Documents/shared"
 BLENDSHAPE_DIR = "/home/zentek/Documents/blendshape"
 TEMP_DIR = "/home/zentek/Documents/temp"
-
+os.environ['PYTHONPATH'] = '/home/zentek/Documents/GPT-SoVITS'
 # 确保路径在sys.path中
-for path in [COSYVOICE_PATH, MATCHA_TTS_PATH, AUDIO2FACE_SAMPLES_PATH]:
+for path in [GPTSOVITS_PATH, GPTSOVITS_MODULE_PATH, AUDIO2FACE_SAMPLES_PATH]:
     if path not in sys.path:
         sys.path.append(path)
 
 # 导入模块
 from chat_digital_human_lib import (
-    load_cosyvoice_model, 
-    get_consistent_reference_audio, 
     get_ai_response,
-    text_to_speech_optimized
+    text_to_speech_optimized,
+    load_gptsovits_model,
+    set_reference_audio_info
 )
 from audio2face3d_client import Audio2Face3DClient
 
@@ -70,9 +70,9 @@ app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 app.mount("/blendshape", StaticFiles(directory=BLENDSHAPE_DIR), name="blendshape")
 
 # 全局变量来存储模型
-cosyvoice_model = None
+gptsovits_model = None
 audio2face_client = None
-reference_audio = None
+reference_info = None
 riva_asr = None
 
 # WebSocket连接管理器
@@ -117,21 +117,25 @@ class SpeechRecognitionRequest(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    global cosyvoice_model, audio2face_client, reference_audio, riva_asr
+    global gptsovits_model, audio2face_client, reference_info, riva_asr
     
-    # 加载CosyVoice模型
-    logger.info("开始加载CosyVoice模型")
-    cosyvoice_model = load_cosyvoice_model()
-    if cosyvoice_model:
-        logger.info("CosyVoice模型加载成功")
-        # 预加载参考音频
-        reference_audio = get_consistent_reference_audio(cosyvoice_model, AUDIO_DIR)
-        if reference_audio is not None:
-            logger.info("参考音频加载成功")
+    # 加载GPT-SoVITS模型
+    logger.info("开始加载GPT-SoVITS模型")
+    gptsovits_model = load_gptsovits_model()
+    if gptsovits_model:
+        logger.info("GPT-SoVITS模型加载成功")
+        # 预加载参考音频信息
+        reference_info = {
+            "ref_audio_path": os.path.join(AUDIO_DIR, "reference_voice.wav"),
+            "prompt_text": "这是一个测试样本",
+            "prompt_lang": "zh"
+        }
+        if os.path.exists(reference_info["ref_audio_path"]):
+            logger.info("参考音频信息加载成功")
         else:
-            logger.error("参考音频加载失败")
+            logger.error("参考音频路径不存在")
     else:
-        logger.error("CosyVoice模型加载失败")
+        logger.error("GPT-SoVITS模型加载失败")
     
     # 初始化Audio2Face客户端
     logger.info("开始初始化Audio2Face客户端")
@@ -153,7 +157,7 @@ async def startup_event():
 
 # 优化: 并行处理AI响应和音频生成
 async def process_ai_response(text, client_id):
-    global cosyvoice_model, audio2face_client, reference_audio
+    global gptsovits_model, audio2face_client, reference_info
     
     start_time = time.time()
     
@@ -192,7 +196,7 @@ async def process_ai_response(text, client_id):
     # 2.1 启动TTS任务
     tts_start = time.time()
     tts_task = asyncio.create_task(
-        text_to_speech_optimized(ai_response, cosyvoice_model, reference_audio, AUDIO_DIR)
+        text_to_speech_optimized(ai_response, gptsovits_model, reference_info, AUDIO_DIR)
     )
     
     # 等待TTS完成
@@ -247,9 +251,9 @@ async def process_ai_response(text, client_id):
 
 @app.post("/talk")
 async def talk(request: TalkRequest):
-    global cosyvoice_model, audio2face_client
+    global gptsovits_model, audio2face_client
     
-    if not cosyvoice_model or not audio2face_client:
+    if not gptsovits_model or not audio2face_client:
         logger.error("模型未加载，无法处理请求")
         return {"error": "模型未加载"}
     
@@ -506,7 +510,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         # 发送模型状态
         await manager.send_message(client_id, {
             "type": "model_status",
-            "cosyvoice_loaded": cosyvoice_model is not None,
+            "gptsovits_loaded": gptsovits_model is not None,
             "audio2face_connected": audio2face_client is not None,
             "riva_asr_available": riva_asr is not None
         })
@@ -692,9 +696,9 @@ async def check_status(request: StatusRequest = None):
     """检查后端服务和模型状态"""
     status = {
         "service": "online",
-        "cosyvoice_model": cosyvoice_model is not None,
+        "gptsovits_model": gptsovits_model is not None,
         "audio2face_client": audio2face_client is not None,
-        "reference_audio": reference_audio is not None,
+        "reference_info": reference_info is not None,
         "riva_asr": riva_asr is not None
     }
     
@@ -739,7 +743,6 @@ async def process_audio_to_blendshape(audio_filepath, client):
                 audio_filepath, 
                 output_csv_path
             )
-        
         if success and os.path.exists(output_csv_path):
             # 检查CSV文件大小
             file_size = os.path.getsize(output_csv_path)
@@ -851,4 +854,4 @@ def get_blendshape_conversion_map():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+    uvicorn.run(app, host="0.0.0.0", port=5000)    

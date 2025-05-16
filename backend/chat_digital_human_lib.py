@@ -17,24 +17,26 @@ import concurrent.futures
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('ChatDigitalHumanLib')
 
-# 添加路径
-COSYVOICE_PATH = "/home/zentek/Documents/CosyVoice"
-MATCHA_TTS_PATH = os.path.join(COSYVOICE_PATH, "third_party/Matcha-TTS")
+# 添加GPT-SoVITS路径
+GPTSOVITS_PATH = "/home/zentek/Documents/GPT-SoVITS/GPT_SoVITS"
+
 
 # 确保路径在sys.path中
-for path in [COSYVOICE_PATH, MATCHA_TTS_PATH]:
+for path in [GPTSOVITS_PATH]:
     if path not in sys.path:
         sys.path.append(path)
 
-# 尝试导入CosyVoice模块
+# 初始化线程池
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+
+# 尝试导入GPT-SoVITS模块
 try:
-    from cosyvoice.cli.cosyvoice import CosyVoice2
-    from cosyvoice.utils.file_utils import load_wav
-    cosyvoice_available = True
-    logger.info("成功加载CosyVoice模块")
+    from GPT_SoVITS.TTS_infer_pack.TTS import TTS, TTS_Config
+    gptsovits_available = True
+    logger.info("成功加载GPT-SoVITS模块")
 except ImportError as e:
-    logger.error(f"无法导入CosyVoice模块: {e}")
-    cosyvoice_available = False
+    logger.error(f"无法导入GPT-SoVITS模块: {e}")
+    gptsovits_available = False
 
 # 配置服务器地址、API密钥和对话ID
 address = "124.74.245.75:8091"
@@ -47,107 +49,58 @@ client = openai.OpenAI(
     api_key=api_key
 )
 
-# 创建线程池
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
-
-# 加载CosyVoice2模型
-def load_cosyvoice_model():
-    if not cosyvoice_available:
-        logger.error("CosyVoice模块不可用")
+# 加载GPT-SoVITS TTS模型
+def load_gptsovits_model():
+    if not gptsovits_available:
+        logger.error("GPT-SoVITS模块不可用")
         return None
         
     try:
-        possible_model_paths = [
-            os.path.join(COSYVOICE_PATH, 'pretrained_models/CosyVoice2-0.5B'),
-            '/home/zentek/pretrained_models/CosyVoice2-0.5B',
-        ]
+        # 设置配置文件路径
+        config_path = os.path.join(GPTSOVITS_PATH, "configs", "tts_infer.yaml")
         
-        model_path = None
-        for path in possible_model_paths:
-            if os.path.exists(path):
-                model_path = path
-                break
-                
-        if model_path is None:
-            logger.error("找不到CosyVoice2模型")
-            return None
+        # 若配置文件不存在，则创建一个默认配置
+        if not os.path.exists(config_path):
+            os.makedirs(os.path.dirname(config_path), exist_ok=True)
+            logger.info(f"配置文件不存在，将使用默认配置: {config_path}")
+            
+        # 加载TTS配置并初始化模型
+        logger.info(f"加载GPT-SoVITS模型配置: {config_path}")
+        tts_config = TTS_Config(config_path)
         
-        # 加载模型时使用优化选项
-        logger.info(f"加载CosyVoice2模型: {model_path}")
-        
-        # 优化：启用FP16加速和JIT编译
-        cosyvoice = CosyVoice2(model_path, 
-                             load_jit=False,  # 使用JIT编译加速
-                             load_trt=False, # 不使用TensorRT
-                             fp16=True)      # 使用半精度加速
-                             
-        logger.info("CosyVoice2模型加载成功")
-        return cosyvoice
+             
+        if torch.cuda.is_available():
+            tts_config.device = torch.device("cuda")
+        else:
+            logger.info("CUDA不可用，使用CPU")
+            tts_config.device = torch.device("cpu")                   
+        # 初始化TTS模型
+        tts_model = TTS(tts_config)
+        logger.info("GPT-SoVITS模型加载成功")
+        return tts_model
     except Exception as e:
-        logger.error(f"CosyVoice2模型加载失败: {e}")
+        logger.error(f"GPT-SoVITS模型加载失败: {e}")
         return None
 
-# 创建一致的参考音频以确保相同的声音音调
-def get_consistent_reference_audio(model, audio_dir):
-    # 创建固定的参考音频
-    prompt_path = os.path.join(audio_dir, "reference_voice.wav")
-    
+# 创建一致的参考音频缓存
+reference_cache = {
+    "ref_audio_path": None,
+    "prompt_text": None,
+    "prompt_lang": None
+}
+
+# 设置默认参考音频信息
+def set_reference_audio_info(ref_audio_path, prompt_text, prompt_lang):
+    """设置参考音频信息用于TTS"""
     try:
-        # 如果文件不存在，创建一个
-        if not os.path.exists(prompt_path):
-            try:
-                # 创建语音样本以确保语音一致性
-                voice_sample_text = "这是一个测试样本"
-                
-                # 首先创建一个简单的参考音频用于第一次生成
-                temp_ref_path = os.path.join(audio_dir, "temp_ref.wav")
-                sample_rate = 16000
-                duration = 1.0
-                t = np.linspace(0., duration, int(sample_rate * duration), endpoint=False)
-                sine_wave = np.sin(2 * np.pi * 440 * t) * 32767 * 0.3
-                sine_wave = sine_wave.astype(np.int16)
-                from scipy.io import wavfile
-                wavfile.write(temp_ref_path, sample_rate, sine_wave)
-                
-                # 加载临时参考音频
-                temp_prompt_speech = load_wav(temp_ref_path, 16000)
-                
-                # 生成真实的参考音频
-                instruction = "用普通话说这句话"
-                
-                results = list(model.inference_instruct2(
-                    voice_sample_text,
-                    instruction,
-                    temp_prompt_speech,
-                    stream=False
-                ))
-                
-                if results and len(results) > 0:
-                    audio_tensor = results[0]['tts_speech']
-                    torchaudio.save(prompt_path, audio_tensor, model.sample_rate)
-                    logger.info(f"参考音频已创建: {prompt_path}")
-                else:
-                    logger.warning("无法生成参考音频，使用临时音频")
-                    return None
-                
-                # 清理临时文件
-                if os.path.exists(temp_ref_path):
-                    os.remove(temp_ref_path)
-            except Exception as e:
-                logger.error(f"创建参考音频失败: {e}")
-                return None
-        
-        # 加载并缓存参考音频
-        try:
-            reference_audio = load_wav(prompt_path, 16000)
-            logger.info("参考音频加载成功")
-            return reference_audio
-        except Exception as e:
-            logger.error(f"加载参考音频失败: {e}")
-            return None
+        reference_cache["ref_audio_path"] = ref_audio_path
+        reference_cache["prompt_text"] = prompt_text
+        reference_cache["prompt_lang"] = prompt_lang
+        logger.info(f"参考音频信息已设置: {ref_audio_path}")
+        return True
     except Exception as e:
-        logger.error(f"处理参考音频时出错: {e}")
-        return None
+        logger.error(f"设置参考音频信息失败: {e}")
+        return False
 
 # 获取AI响应 - 优化版
 async def get_ai_response(user_input, messages=None):
@@ -216,137 +169,78 @@ def split_into_sentences(text, max_length=100):
     
     return merged_sentences
 
-# 批处理TTS生成 - 提高效率
-async def batch_generate_audio(sentences, model, reference_audio, batch_size=3):
-    """批量处理句子生成音频"""
-    if not sentences:
-        return []
-    
-    # 创建批次
-    batches = [sentences[i:i+batch_size] for i in range(0, len(sentences), batch_size)]
-    all_results = []
-    
-    for batch in batches:
-        # 创建并行任务
-        tasks = []
-        for sentence in batch:
-            if sentence.strip():
-                task = asyncio.create_task(generate_audio_for_sentence(sentence, model, reference_audio))
-                tasks.append(task)
-        
-        # 执行批处理
-        batch_results = await asyncio.gather(*tasks)
-        all_results.extend([result for result in batch_results if result is not None])
-    
-    return all_results
-
-# 单句TTS生成 - 优化版
-async def generate_audio_for_sentence(text, model, reference_audio):
-    try:
-        # 提前准备指令
-        instruction = "用普通话说这句话"
-        
-        # 使用线程池处理耗时的TTS操作
-        def process_tts():
-            results = list(model.inference_instruct2(
-                text,
-                instruction,
-                reference_audio,
-                stream=False
-            ))
-            
-            if results and len(results) > 0:
-                audio_tensor = results[0]['tts_speech']
-                return audio_tensor.numpy()
-            return None
-        
-        # 异步执行TTS
-        loop = asyncio.get_event_loop()
-        audio_np = await loop.run_in_executor(executor, process_tts)
-        
-        if audio_np is not None and len(audio_np.shape) > 1:
-            audio_np = audio_np.flatten()
-            
-        return audio_np
-    except Exception as e:
-        logger.error(f"句子生成错误: {e}")
-        return None
-
-# 优化的TTS处理函数 - 支持批处理
-async def text_to_speech_optimized(text, model, reference_audio, audio_dir):
-    """优化的TTS函数 - 使用批处理和异步处理"""
+# 优化的TTS处理函数 - 使用GPT-SoVITS
+async def text_to_speech_optimized(text, tts_model, reference_info, audio_dir):
+    """优化的TTS函数 - 使用GPT-SoVITS"""
     start_time = time.time()
     try:
-        if model is None or reference_audio is None:
-            logger.error("CosyVoice2模型或参考音频未加载")
+        if tts_model is None:
+            logger.error("GPT-SoVITS模型未加载")
             return None, None
             
         # 清理GPU内存
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            
-        # 处理短文本 - 直接生成
-        if len(text) <= 50:
-            logger.info(f"处理短文本直接生成: {text}")
-            audio_np = await generate_audio_for_sentence(text, model, reference_audio)
-            
-            if audio_np is not None:
-                # 保存音频
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                wavfile_path = os.path.join(audio_dir, f"response_audio_{timestamp}.wav")
-                sample_rate = model.sample_rate
-                sf.write(wavfile_path, audio_np, sample_rate)
-                
-                logger.info(f"短文本音频已保存: {wavfile_path}")
-                logger.info(f"TTS处理时间: {time.time() - start_time:.2f}秒")
-                return audio_np, wavfile_path
-            else:
-                logger.error("短文本音频生成失败")
+
+        # 使用配置进行TTS合成
+        ref_audio_path = reference_info.get("ref_audio_path")
+        prompt_text = reference_info.get("prompt_text", "")
+        prompt_lang = reference_info.get("prompt_lang", "zh")
         
-        # 分割文本为句子
-        sentences = split_into_sentences(text, max_length=100)
-        logger.info(f"文本已分割为 {len(sentences)} 个句子")
-        
-        # 批量处理TTS生成
-        audio_segments = await batch_generate_audio(sentences, model, reference_audio, batch_size=3)
-        
-        if not audio_segments:
-            logger.error("没有成功生成的音频片段")
+        # 如果缺少必要参数，返回错误
+        if not ref_audio_path or not os.path.exists(ref_audio_path):
+            logger.error(f"参考音频路径不存在: {ref_audio_path}")
             return None, None
-            
-        logger.info(f"成功生成 {len(audio_segments)} 个音频片段")
+
+        # 构建GPT-SoVITS输入参数
+        tts_inputs = {
+            "text": text,
+            "text_lang": "zh",  # 假设默认中文，可以根据需要修改
+            "ref_audio_path": ref_audio_path,
+            "prompt_text": prompt_text,
+            "prompt_lang": prompt_lang,
+            "top_k": 5,
+            "top_p": 0.6,
+            "temperature": 0.6,
+            "text_split_method": "cut5",  # 使用更好的分句方法
+            "batch_size": 1,
+            "speed_factor": 1.0
+        }
         
-        # 连接片段 - 使用更短的暂停
-        sample_rate = model.sample_rate
-        pause_duration = 0.05  # 极短的暂停
-        pause_samples = np.zeros(int(pause_duration * sample_rate))
+        logger.info(f"开始GPT-SoVITS音频合成: {text[:50]}...")
         
-        # 合并所有段
-        combined_segments = []
-        for segment in audio_segments:
-            if len(segment) > 0:
-                combined_segments.append(segment)
-                combined_segments.append(pause_samples)
-                
-        if combined_segments and len(combined_segments) > 1:
-            combined_segments.pop()  # 移除最后一个暂停
-            
-        # 合并音频
-        combined_audio = np.concatenate(combined_segments)
+        # 异步运行GPT-SoVITS推理
+        def run_inference():
+            try:
+                # 运行TTS推理 (GPT-SoVITS的run方法返回生成器)
+                for sr, audio_data in tts_model.run(tts_inputs):
+                    # 只取第一个结果
+                    return audio_data, sr
+            except Exception as e:
+                logger.error(f"GPT-SoVITS推理出错: {e}")
+                return None, None
         
-        # 归一化音频
-        max_val = np.max(np.abs(combined_audio))
-        if max_val > 0:
-            combined_audio = combined_audio / max_val * 0.9
-            
-        # 保存最终音频
+        # 在异步环境中运行TTS推理
+        loop = asyncio.get_event_loop()
+        audio_data, sample_rate = await loop.run_in_executor(executor, run_inference)
+        
+        if audio_data is None:
+            logger.error("TTS生成失败")
+            return None, None
+        
+        # 保存音频文件
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         wavfile_path = os.path.join(audio_dir, f"response_audio_{timestamp}.wav")
-        sf.write(wavfile_path, combined_audio, sample_rate)
+        
+        # 确保音频目录存在
+        os.makedirs(audio_dir, exist_ok=True)
+        
+        # 保存为WAV文件
+        sf.write(wavfile_path, audio_data, sample_rate)
         
         total_time = time.time() - start_time
         logger.info(f"TTS处理完成，耗时: {total_time:.2f}秒")
-        return combined_audio, wavfile_path
+        return audio_data, wavfile_path
             
     except Exception as e:
         logger.error(f"TTS处理错误: {e}")
