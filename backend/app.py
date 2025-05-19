@@ -20,25 +20,26 @@ import subprocess
 import tempfile
 import time
 
-# 设置路径
-GPTSOVITS_PATH = "/home/zentek/Documents/GPT-SoVITS"
-GPTSOVITS_MODULE_PATH = os.path.join(GPTSOVITS_PATH, "GPT_SoVITS")
+os.chdir("/home/zentek/Documents/GPT-SoVITS")
+GPT_SOVITS_PATH = "/home/zentek/Documents/GPT-SoVITS/GPT_SoVITS"
 AUDIO2FACE_SAMPLES_PATH = "/home/zentek/Documents/Audio2Face-3D-Samples"
 AUDIO_DIR = "/home/zentek/Documents/shared"
 BLENDSHAPE_DIR = "/home/zentek/Documents/blendshape"
 TEMP_DIR = "/home/zentek/Documents/temp"
-os.environ['PYTHONPATH'] = '/home/zentek/Documents/GPT-SoVITS'
+
 # 确保路径在sys.path中
-for path in [GPTSOVITS_PATH, GPTSOVITS_MODULE_PATH, AUDIO2FACE_SAMPLES_PATH]:
+for path in [GPT_SOVITS_PATH, AUDIO2FACE_SAMPLES_PATH]:
     if path not in sys.path:
         sys.path.append(path)
 
+sys.path.append("/home/zentek/Documents/GPT-SoVITS")
+
 # 导入模块
 from chat_digital_human_lib import (
+    load_gptsovits_model, 
+    get_reference_audio_path, 
     get_ai_response,
-    text_to_speech_optimized,
-    load_gptsovits_model,
-    set_reference_audio_info
+    text_to_speech_optimized
 )
 from audio2face3d_client import Audio2Face3DClient
 
@@ -72,7 +73,7 @@ app.mount("/blendshape", StaticFiles(directory=BLENDSHAPE_DIR), name="blendshape
 # 全局变量来存储模型
 gptsovits_model = None
 audio2face_client = None
-reference_info = None
+reference_audio_path = None
 riva_asr = None
 
 # WebSocket连接管理器
@@ -117,23 +118,19 @@ class SpeechRecognitionRequest(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    global gptsovits_model, audio2face_client, reference_info, riva_asr
+    global gptsovits_model, audio2face_client, reference_audio_path, riva_asr
     
     # 加载GPT-SoVITS模型
     logger.info("开始加载GPT-SoVITS模型")
     gptsovits_model = load_gptsovits_model()
     if gptsovits_model:
         logger.info("GPT-SoVITS模型加载成功")
-        # 预加载参考音频信息
-        reference_info = {
-            "ref_audio_path": os.path.join(AUDIO_DIR, "reference_voice.wav"),
-            "prompt_text": "这是一个测试样本",
-            "prompt_lang": "zh"
-        }
-        if os.path.exists(reference_info["ref_audio_path"]):
-            logger.info("参考音频信息加载成功")
+        # 预加载参考音频路径
+        reference_audio_path = get_reference_audio_path(AUDIO_DIR)
+        if reference_audio_path is not None:
+            logger.info("参考音频路径加载成功")
         else:
-            logger.error("参考音频路径不存在")
+            logger.error("参考音频路径加载失败")
     else:
         logger.error("GPT-SoVITS模型加载失败")
     
@@ -157,7 +154,7 @@ async def startup_event():
 
 # 优化: 并行处理AI响应和音频生成
 async def process_ai_response(text, client_id):
-    global gptsovits_model, audio2face_client, reference_info
+    global gptsovits_model, audio2face_client, reference_audio_path
     
     start_time = time.time()
     
@@ -196,7 +193,7 @@ async def process_ai_response(text, client_id):
     # 2.1 启动TTS任务
     tts_start = time.time()
     tts_task = asyncio.create_task(
-        text_to_speech_optimized(ai_response, gptsovits_model, reference_info, AUDIO_DIR)
+        text_to_speech_optimized(ai_response, gptsovits_model, reference_audio_path, AUDIO_DIR)
     )
     
     # 等待TTS完成
@@ -698,7 +695,7 @@ async def check_status(request: StatusRequest = None):
         "service": "online",
         "gptsovits_model": gptsovits_model is not None,
         "audio2face_client": audio2face_client is not None,
-        "reference_info": reference_info is not None,
+        "reference_audio_path": reference_audio_path is not None,
         "riva_asr": riva_asr is not None
     }
     
@@ -743,8 +740,10 @@ async def process_audio_to_blendshape(audio_filepath, client):
                 audio_filepath, 
                 output_csv_path
             )
+        
         if success and os.path.exists(output_csv_path):
             # 检查CSV文件大小
+           
             file_size = os.path.getsize(output_csv_path)
             logger.info(f"生成Blendshape数据文件: {output_csv_path}, 大小: {file_size} 字节")
             
@@ -854,4 +853,4 @@ def get_blendshape_conversion_map():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=5000)    
+    uvicorn.run(app, host="0.0.0.0", port=5000)
