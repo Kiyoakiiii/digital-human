@@ -27,12 +27,15 @@ let clientId = 'client_' + Math.random().toString(36).substr(2, 9);
 let mediaRecorder = null;
 let audioChunks = [];
 
-// 保持Avatar完整实现，不做简化
-function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setResponse, setAnimReady, animationData, setAudioElement }) {
+// 保持Avatar完整实现，但增加了处理连续动画的能力
+function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setResponse, setAnimReady, animationData, setAudioElement, isAudioPlaying }) {
   let gltf = useGLTF(avatar_url);
   let morphTargetDictionaryBody = null;
   let morphTargetDictionaryLowerTeeth = null;
   const mixerRef = useRef(null);
+  
+  // 新增：存储当前活动的clips以便可以管理多个动画
+  const activeClipsRef = useRef([]);
 
   const [
     bodyTexture,
@@ -89,7 +92,6 @@ function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setRes
   tshirtNormalTexture.encoding = LinearEncoding;
   teethNormalTexture.encoding = LinearEncoding;
   hairNormalTexture.encoding = LinearEncoding;
-
 
   gltf.scene.traverse(node => {
     if(node.type === 'Mesh' || node.type === 'LineSegments' || node.type === 'SkinnedMesh') {
@@ -163,7 +165,8 @@ function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setRes
     }
   });
 
-  const [clips, setClips] = useState([]);
+  // 修改：使用ref存储多个clips，支持流式处理
+  const [baseClips, setBaseClips] = useState([]);
   const mixer = useMemo(() => {
     const newMixer = new THREE.AnimationMixer(gltf.scene);
     mixerRef.current = newMixer;
@@ -173,23 +176,27 @@ function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setRes
   // 当clips变化时，通知App组件动画状态
   useEffect(() => {
     if (setAnimReady) {
-      setAnimReady(clips.length > 0);
+      setAnimReady(baseClips.length > 0);
     }
-  }, [clips, setAnimReady]);
+  }, [baseClips, setAnimReady]);
 
-  // 更新处理动画数据
+  // 修改：处理新的动画数据片段
   useEffect(() => {
     if (animationData && animationData.blendData) {
-      console.log("处理动画数据，帧数:", animationData.blendData.length);
+      console.log("处理新动画数据片段，帧数:", animationData.blendData.length);
 
       // 创建动画剪辑
       const newClips = [
         createAnimation(animationData.blendData, morphTargetDictionaryBody, 'HG_Body'),
         createAnimation(animationData.blendData, morphTargetDictionaryLowerTeeth, 'HG_TeethLower')
-      ];
+      ].filter(clip => clip !== null);
 
-      console.log("动画剪辑已创建:", newClips.map(c => c.tracks.length + "个轨道"));
-      setClips(newClips);
+      if (newClips.length > 0) {
+        console.log("动画剪辑已创建:", newClips.map(c => c.tracks.length + "个轨道"));
+        // 将新创建的clips添加到当前活动clips中
+        activeClipsRef.current = [...activeClipsRef.current, ...newClips];
+        setBaseClips(prev => [...prev, ...newClips]);
+      }
     }
   }, [animationData]);
 
@@ -216,6 +223,7 @@ function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setRes
     return track;
   });
 
+  // 设置基础动画
   useEffect(() => {
     let idleClipAction = mixer.clipAction(idleClips[0]);
     idleClipAction.play();
@@ -225,60 +233,59 @@ function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setRes
     blinkAction.play();
   }, []);
 
-  // 播放动画剪辑
+  // 修改：流式播放动画
   useEffect(() => {
-    if (playing === false || !clips || clips.length === 0)
+    if (playing === false || !baseClips || baseClips.length === 0)
       return;
 
-    console.log("开始播放动画剪辑，数量:", clips.length);
+    console.log("播放流式动画，当前活动动画数量:", activeClipsRef.current.length);
 
-    // 停止所有正在播放的动作（除了眨眼和idle）
-    mixer.stopAllAction();
-
-    // 重新播放基础动画
-    let idleClipAction = mixer.clipAction(idleClips[0]);
-    idleClipAction.play();
-
-    let blinkClip = createAnimation(blinkData, morphTargetDictionaryBody, 'HG_Body');
-    let blinkAction = mixer.clipAction(blinkClip);
-    blinkAction.play();
-
-    // 播放新的表情动画
-    _.each(clips, clip => {
+    // 播放最近添加的动画剪辑
+    const latestClips = activeClipsRef.current.slice(-2); // 获取最新添加的两个clip (身体和牙齿)
+    
+    _.each(latestClips, clip => {
       if (clip && clip.tracks && clip.tracks.length > 0) {
         let clipAction = mixer.clipAction(clip);
         clipAction.setLoop(THREE.LoopOnce);
         clipAction.clampWhenFinished = true; // 动画结束时保持最后一帧
         clipAction.play();
         console.log("播放动画剪辑，轨道数:", clip.tracks.length);
-      } else {
-        console.warn("跳过无效的动画剪辑");
       }
     });
-  }, [playing, clips]);
+  }, [playing, animationData]);
 
-  // 暂停播放时重置动画
-  useEffect(() => {
-    if (playing === false && clips && clips.length > 0 && mixerRef.current) {
-      // 暂停所有当前播放的表情动画
-      _.each(clips, clip => {
-        if (clip && clip.tracks && clip.tracks.length > 0) {
-          const action = mixerRef.current.existingAction(clip);
-          if (action) {
-            action.stop();
-          }
+  // 停止所有动画并重置
+  const resetAllAnimations = useCallback(() => {
+    // 停止所有当前播放的表情动画
+    _.each(activeClipsRef.current, clip => {
+      if (clip && clip.tracks && clip.tracks.length > 0) {
+        const action = mixerRef.current.existingAction(clip);
+        if (action) {
+          action.stop();
         }
-      });
+      }
+    });
 
-      // 确保基础动画继续播放
-      let idleClipAction = mixerRef.current.clipAction(idleClips[0]);
-      idleClipAction.play();
+    // 清空活动动画列表
+    activeClipsRef.current = [];
+    setBaseClips([]);
 
-      let blinkClip = createAnimation(blinkData, morphTargetDictionaryBody, 'HG_Body');
-      let blinkAction = mixerRef.current.clipAction(blinkClip);
-      blinkAction.play();
+    // 确保基础动画继续播放
+    let idleClipAction = mixerRef.current.clipAction(idleClips[0]);
+    idleClipAction.play();
+
+    let blinkClip = createAnimation(blinkData, morphTargetDictionaryBody, 'HG_Body');
+    let blinkAction = mixerRef.current.clipAction(blinkClip);
+    blinkAction.play();
+  }, [mixer, idleClips]);
+
+  // 监听播放状态变化
+  useEffect(() => {
+    if (!isAudioPlaying && activeClipsRef.current.length > 0) {
+      console.log("音频播放结束，重置所有动画");
+      resetAllAnimations();
     }
-  }, [playing]);
+  }, [isAudioPlaying, resetAllAnimations]);
 
   useFrame((state, delta) => {
     mixer.update(delta);
@@ -536,11 +543,15 @@ function App() {
   const [recordingStatus, setRecordingStatus] = useState("点击麦克风按钮开始录音");
   const [statusMessage, setStatusMessage] = useState("");
   const [conversation, setConversation] = useState([]);
-  const [audioElement, setAudioElement] = useState(null);
   const [wsReady, setWsReady] = useState(false);
-
-  // 保存处理中的任务
-  const processingTaskRef = useRef(null);
+  
+  // 新增：流式音频处理状态
+  const [audioQueue, setAudioQueue] = useState([]);
+  const [isAudioPlaying, setIsAudioPlaying] = useState(false);
+  const [currentAudioIndex, setCurrentAudioIndex] = useState(0);
+  const currentAudioRef = useRef(null);
+  const processingRef = useRef(false);
+  const responseTextRef = useRef("");
 
   // 限制对话历史长度
   useEffect(() => {
@@ -588,6 +599,18 @@ function App() {
   const sendAudioViaWebSocket = useCallback((audioBlob) => {
     console.log("通过WebSocket发送音频");
 
+    // 重置所有流式处理状态
+    setAudioQueue([]);
+    setCurrentAudioIndex(0);
+    processingRef.current = false;
+    responseTextRef.current = "";
+    setAnimationData(null);
+    
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current = null;
+    }
+
     // 创建表单数据
     const reader = new FileReader();
     reader.onload = () => {
@@ -609,6 +632,18 @@ function App() {
   // 通过HTTP发送音频
   const sendAudioViaHttp = useCallback(async (audioBlob) => {
     console.log("通过HTTP API发送音频");
+
+    // 重置所有流式处理状态
+    setAudioQueue([]);
+    setCurrentAudioIndex(0);
+    processingRef.current = false;
+    responseTextRef.current = "";
+    setAnimationData(null);
+    
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current = null;
+    }
 
     const formData = new FormData();
     formData.append('audio', audioBlob);
@@ -642,22 +677,98 @@ function App() {
 
   // 取消进行中的任务
   const cancelProcessingTask = useCallback(() => {
-    if (processingTaskRef.current) {
-      clearTimeout(processingTaskRef.current);
-      processingTaskRef.current = null;
+    // 停止当前播放的音频
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current = null;
     }
     
-    // 停止当前播放的音频
-    if (audioElement) {
-      audioElement.pause();
-      audioElement.currentTime = 0;
-    }
+    // 重置流式处理状态
+    setAudioQueue([]);
+    setCurrentAudioIndex(0);
+    setIsAudioPlaying(false);
+    processingRef.current = false;
+    responseTextRef.current = "";
     
     // 重置状态
     setPlaying(false);
     setAnimationData(null);
     setStatusMessage("");
-  }, [audioElement]);
+  }, []);
+
+  // 新增：处理流式音频队列
+  useEffect(() => {
+    // 当有新的音频添加到队列时，检查是否需要开始播放
+    if (audioQueue.length > 0 && !isAudioPlaying && currentAudioIndex < audioQueue.length) {
+      console.log(`开始播放音频片段 ${currentAudioIndex+1}/${audioQueue.length}`);
+      
+      const currentSegment = audioQueue[currentAudioIndex];
+      const audio = new Audio(currentSegment.audioUrl);
+      currentAudioRef.current = audio;
+      
+      // 设置播放事件
+      audio.oncanplay = () => {
+        console.log(`音频片段 ${currentAudioIndex+1} 已加载，准备播放`);
+        
+        // 设置动画数据
+        if (currentSegment.blendData) {
+          setAnimationData({ blendData: currentSegment.blendData });
+          setPlaying(true);
+        }
+        
+        // 播放音频
+        audio.play()
+          .then(() => {
+            console.log(`开始播放音频片段 ${currentAudioIndex+1}`);
+            setIsAudioPlaying(true);
+          })
+          .catch(error => {
+            console.error(`播放音频片段 ${currentAudioIndex+1} 失败:`, error);
+            playNextAudio();
+          });
+      };
+      
+      // 当前音频播放结束时
+      audio.onended = () => {
+        console.log(`音频片段 ${currentAudioIndex+1} 播放结束`);
+        playNextAudio();
+      };
+      
+      // 音频加载错误
+      audio.onerror = () => {
+        console.error(`音频片段 ${currentAudioIndex+1} 加载出错`);
+        playNextAudio();
+      };
+    }
+  }, [audioQueue, isAudioPlaying, currentAudioIndex]);
+  
+  // 播放下一个音频片段
+  const playNextAudio = useCallback(() => {
+    // 清理当前音频
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current = null;
+    }
+    
+    // 更新索引
+    setCurrentAudioIndex(prev => prev + 1);
+    setIsAudioPlaying(false);
+    
+    // 检查是否所有片段都已播放完毕
+    if (currentAudioIndex + 1 >= audioQueue.length) {
+      console.log("所有音频片段播放完毕");
+      
+      // 所有片段播放完毕
+      if (!processingRef.current) {
+        // 没有更多待处理的片段，完全结束
+        setPlaying(false);
+        setStatusMessage("");
+      } else {
+        // 仍在处理中，等待下一个片段
+        setStatusMessage("继续处理更多内容...");
+      }
+    }
+  }, [currentAudioIndex, audioQueue.length]);
 
   // 初始化WebSocket
   useEffect(() => {
@@ -681,15 +792,69 @@ function App() {
     };
   }, []);
 
-  // 设置WebSocket消息处理
+  // 设置WebSocket消息处理 - 修改以支持流式处理
   useEffect(() => {
     if (websocket) {
       websocket.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data);
-          console.log("收到WebSocket消息:", message);
-
-          if (message.type === "processing_complete") {
+          
+          console.log("收到WebSocket消息类型:", message.type);
+          // 修改：处理流式音频片段
+          if (message.type === "stream_audio_segment") {
+            console.log("收到流式音频片段");
+            
+            // 确保音频URL是完整路径
+            let audioPath = message.filename;
+            if (!audioPath.startsWith('http')) {
+              audioPath = `${host}${audioPath}`;
+            }
+            
+            // 将音频片段添加到队列
+            setAudioQueue(prev => [...prev, {
+              audioUrl: audioPath,
+              blendData: message.blendData,
+              text: message.text
+            }]);
+            
+            // 更新处理状态
+            processingRef.current = message.more_segments;
+            
+            // 更新文本显示
+            if (message.text) {
+              responseTextRef.current += message.text;
+              setResponse(responseTextRef.current);
+              
+              // 如果这是第一个片段，添加到对话历史
+              if (message.is_first_segment) {
+                setConversation(prev => [...prev, {
+                  role: 'assistant',
+                  content: responseTextRef.current
+                }]);
+              } else {
+                // 更新最后一个对话
+                setConversation(prev => {
+                  const newConversation = [...prev];
+                  if (newConversation.length > 0) {
+                    newConversation[newConversation.length - 1] = {
+                      ...newConversation[newConversation.length - 1],
+                      content: responseTextRef.current
+                    };
+                  }
+                  return newConversation;
+                });
+              }
+            }
+            
+            // 更新状态消息
+            if (message.more_segments) {
+              setStatusMessage("处理下一个片段...");
+            } else {
+              setStatusMessage("所有内容已处理完成");
+            }
+          }
+          // 保留对旧消息类型的处理以兼容性
+          else if (message.type === "processing_complete") {
             console.log("处理完成，获取Blendshape数据和音频");
 
             // 确保音频URL是完整路径
@@ -710,6 +875,7 @@ function App() {
                 .then(() => {
                   console.log("开始播放音频");
                   setPlaying(true);
+                  setIsAudioPlaying(true);
                 })
                 .catch(error => {
                   console.error("播放音频失败:", error);
@@ -719,10 +885,11 @@ function App() {
             audio.onended = () => {
               console.log("音频播放结束");
               setPlaying(false);
+              setIsAudioPlaying(false);
               setAnimationData(null);
             };
 
-            setAudioElement(audio);
+            currentAudioRef.current = audio;
 
             if (message.text) {
               setResponse(message.text);
@@ -739,7 +906,8 @@ function App() {
           else if (message.type === "ai_response") {
             console.log("收到AI响应:", message.text);
             if (message.text) {
-              setResponse(message.text);
+              // 只是更新临时响应，流式片段会更新实际显示
+              setStatusMessage("AI已响应，正在生成语音...");
             }
           }
           else if (message.type === "speech_recognition_result") {
@@ -751,6 +919,12 @@ function App() {
                 content: message.text
               }]);
               setStatusMessage("识别完成，等待回复...");
+              
+              // 重置流式处理状态
+              responseTextRef.current = "";
+              setAudioQueue([]);
+              setCurrentAudioIndex(0);
+              processingRef.current = true;
             } else {
               setStatusMessage("语音识别结果为空");
             }
@@ -763,6 +937,9 @@ function App() {
             console.error("WebSocket错误:", message.message);
             alert(`处理时出错: ${message.message}`);
             setStatusMessage("");
+            
+            // 重置处理状态
+            processingRef.current = false;
           }
         } catch (error) {
           console.error("解析WebSocket消息时出错:", error);
@@ -792,8 +969,8 @@ function App() {
 
   // 处理录音按钮点击
   const handleRecordClick = useCallback(async () => {
-    // 如果当前正在播放，则取消当前任务
-    if (playing) {
+    // 如果当前正在播放或处理中，则取消当前任务
+    if (isAudioPlaying || processingRef.current) {
       cancelProcessingTask();
       return;
     }
@@ -816,7 +993,7 @@ function App() {
         }
       }
     }
-  }, [isRecording, micStream, stopRecording, playing, cancelProcessingTask]);
+  }, [isRecording, micStream, stopRecording, isAudioPlaying, cancelProcessingTask]);
 
   // 获取最后一条消息用于显示
   const lastMessage = conversation.length > 0 ? conversation[conversation.length - 1] : null;
@@ -824,9 +1001,9 @@ function App() {
   // 计算麦克风按钮文本
   const getMicButtonText = useCallback(() => {
     if (isRecording) return '■';
-    if (playing) return '✕';
+    if (isAudioPlaying || processingRef.current) return '✕';
     return '🎤';
-  }, [isRecording, playing]);
+  }, [isRecording, isAudioPlaying]);
 
   return (
     <div style={STYLES.container}>
@@ -894,7 +1071,7 @@ function App() {
             setResponse={setResponse}
             setAnimReady={setAnimReady}
             animationData={animationData}
-            setAudioElement={setAudioElement}
+            isAudioPlaying={isAudioPlaying}
           />
         </Suspense>
 

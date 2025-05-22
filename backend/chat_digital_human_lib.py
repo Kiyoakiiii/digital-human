@@ -47,8 +47,25 @@ client = openai.OpenAI(
 # 创建线程池
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
+# 缓存变量 - 用于存储已加载的模型和优化TTS处理
+_tts_model_cache = None
+_last_tts_request_time = None
+_tts_model_load_time = None
+
 # 加载GPT-SoVITS模型
 def load_gptsovits_model(config_path=None):
+    global _tts_model_cache, _tts_model_load_time
+    
+    # 如果已有缓存的模型，且加载不超过24小时，直接返回
+    current_time = time.time()
+    if _tts_model_cache is not None and _tts_model_load_time is not None:
+        # 检查模型是否是最近24小时内加载的
+        if current_time - _tts_model_load_time < 24 * 3600:
+            logger.info("使用缓存的GPT-SoVITS模型")
+            return _tts_model_cache
+        else:
+            logger.info("缓存的模型已超过24小时，重新加载")
+    
     if not gptsovits_available:
         logger.error("GPT-SoVITS模块不可用")
         return None
@@ -66,8 +83,16 @@ def load_gptsovits_model(config_path=None):
         tts_config.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"使用设备: {tts_config.device}")
         
+        # 清理GPU内存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
         # 初始化TTS模型
         tts_model = TTS(tts_config)
+        
+        # 更新缓存
+        _tts_model_cache = tts_model
+        _tts_model_load_time = current_time
         
         logger.info("GPT-SoVITS模型加载成功")
         return tts_model
@@ -87,8 +112,19 @@ def get_reference_audio_path(audio_dir):
     logger.info(f"参考音频: {ref_path}")
     return ref_path
 
-# 获取AI响应 - 优化版
-async def get_ai_response(user_input, messages=None):
+# 修改：支持流式AI响应
+def get_ai_response(user_input, messages=None, stream=False):
+    """
+    获取AI响应，支持流式和非流式模式
+    
+    参数:
+        user_input: 用户输入
+        messages: 对话历史
+        stream: 是否使用流式模式
+        
+    返回:
+        流式模式返回生成器，非流式模式返回字符串
+    """
     try:
         if messages is None:
             messages = []
@@ -97,8 +133,21 @@ async def get_ai_response(user_input, messages=None):
         
         logger.info(f"发送用户输入到AI: {user_input[:50]}...")
         
-        # 使用优化的参数设置
-        response = await asyncio.to_thread(client.chat.completions.create,
+        # 流式模式
+        if stream:
+            response = client.chat.completions.create(
+                model="model",
+                messages=messages,
+                max_tokens=200,
+                temperature=0.7,
+                stream=True
+            )
+            
+            # 直接返回流式生成器
+            return response
+        
+        # 非流式模式（保持原有逻辑）
+        response = client.chat.completions.create(
              model="model",
              messages=messages,
              max_tokens=200,
@@ -117,47 +166,128 @@ async def get_ai_response(user_input, messages=None):
         return ai_response
     except Exception as e:
         logger.error(f"获取AI响应错误: {e}")
+        if stream:
+            # 返回一个空的生成器
+            return iter([])
         return "获取响应出错，请稍后再试"
 
-# 将文本分割成句子以进行批处理
-def split_into_sentences(text, max_length=100):
-    # 简化的句子分割
-    sentences = re.split(r'([。！？\.!?;；\n])', text)
-    result = []
-    
-    # 重新组合句子和标点
-    i = 0
-    while i < len(sentences) - 1:
-        if i + 1 < len(sentences):
-            result.append(sentences[i] + sentences[i+1])
-        i += 2
-    
-    # 处理最后一个片段(如果没有标点)
-    if i < len(sentences):
-        result.append(sentences[i])
-    
-    # 合并短句子
-    merged_sentences = []
-    current = ""
-    
-    for s in result:
-        if s.strip():  # 跳过空句子
-            if len(current) + len(s) <= max_length:
-                current += s
-            else:
-                if current:
-                    merged_sentences.append(current)
-                current = s
-    
-    if current:
-        merged_sentences.append(current)
-    
-    return merged_sentences
+# 异步版本的AI响应获取（为了兼容性保留）
+async def get_ai_response_async(user_input, messages=None, stream=False):
+    """异步获取AI响应"""
+    return await asyncio.to_thread(get_ai_response, user_input, messages, stream)
 
-# 优化的TTS处理函数 - 使用GPT-SoVITS
+# 将文本分割成句子以进行批处理 - 优化版，适配参考代码的分段逻辑
+def split_into_sentences(text, max_length=100):
+    """
+    将文本智能分割成句子，采用参考代码的分段策略
+    
+    参数:
+        text: 需要分割的文本
+        max_length: 每个句子的最大长度（字符数）
+    
+    返回:
+        分割后的句子列表
+    """
+    if not text:
+        return []
+    
+    # 使用参考代码的标点符号策略
+    biao_dian_2 = ["…", "~", "。", "？", "！", "?", "!"]
+    biao_dian_3 = ["…", "~", "。", "？", "！", "?", "!", ",", "，"]
+    
+    # 基本文本清理
+    text = text.replace("...", "…")
+    
+    # 简单的括号内容清理
+    cleaned_text = ""
+    skip = False
+    for char in text:
+        if char in ["(", "（"]:
+            skip = True
+            continue
+        if char in [")", "）"]:
+            skip = False
+            continue
+        if not skip:
+            cleaned_text += char
+    
+    # 分段处理
+    sentences = []
+    start = 0
+    first_segment = True
+    
+    for i in range(len(cleaned_text)):
+        if first_segment:
+            # 第一段使用严格标点
+            if cleaned_text[i] in biao_dian_3 and i - start > 3:
+                segment = cleaned_text[start:i+1].strip()
+                if len(segment) > 1:
+                    sentences.append(segment)
+                start = i + 1
+                first_segment = False
+        else:
+            # 后续段落使用宽松标点
+            if cleaned_text[i] in biao_dian_2 and i - start > 6:
+                segment = cleaned_text[start:i+1].strip()
+                if len(segment) > 1:
+                    sentences.append(segment)
+                start = i + 1
+        
+        # 防止段落过长
+        if i - start >= max_length:
+            # 寻找最近的逗号或其他分割点
+            for j in range(i, start, -1):
+                if cleaned_text[j] in [",", "，", "、"]:
+                    segment = cleaned_text[start:j+1].strip()
+                    if len(segment) > 1:
+                        sentences.append(segment)
+                    start = j + 1
+                    break
+            else:
+                # 没找到合适分割点，强制分割
+                segment = cleaned_text[start:i].strip()
+                if len(segment) > 1:
+                    sentences.append(segment)
+                start = i
+    
+    # 处理剩余文本
+    if start < len(cleaned_text):
+        remaining = cleaned_text[start:].strip()
+        if len(remaining) > 1:
+            sentences.append(remaining)
+    
+    # 后处理：合并过短的句子
+    final_sentences = []
+    for sentence in sentences:
+        if len(sentence.strip()) > 0:
+            # 过滤掉只包含标点的句子
+            if not all(c in ["…", "~", "。", "？", "！", "?", "!", ",", "，", " "] for c in sentence):
+                final_sentences.append(sentence.strip())
+    
+    return final_sentences
+
+# 优化的TTS处理函数 - 针对流式处理优化，保持原有逻辑
 async def text_to_speech_optimized(text, tts_model, ref_audio_path, audio_dir):
-    """使用GPT-SoVITS进行TTS生成"""
+    """
+    使用GPT-SoVITS进行TTS生成，针对流式处理优化
+    
+    参数:
+        text: 要合成的文本
+        tts_model: GPT-SoVITS模型实例
+        ref_audio_path: 参考音频路径
+        audio_dir: 音频输出目录
+        
+    返回:
+        (audio_numpy_array, audio_file_path)
+    """
+    global _last_tts_request_time
+    
     start_time = time.time()
+    current_time = start_time
+    
+    # 更新上次请求时间
+    _last_tts_request_time = current_time
+    
     try:
         if tts_model is None or ref_audio_path is None:
             logger.error("GPT-SoVITS模型或参考音频未加载")
@@ -168,8 +298,16 @@ async def text_to_speech_optimized(text, tts_model, ref_audio_path, audio_dir):
             torch.cuda.empty_cache()
         
         # 创建时间戳以生成唯一文件名
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S%f")[:-3]
         wavfile_path = os.path.join(audio_dir, f"response_audio_{timestamp}.wav")
+        
+        # 为空文本快速返回静音
+        if not text or text.strip() == "":
+            logger.warning("收到空文本，生成静音音频")
+            # 创建短静音音频
+            empty_audio = np.zeros(16000, dtype=np.float32)  # 1秒静音
+            sf.write(wavfile_path, empty_audio, 16000)
+            return empty_audio, wavfile_path
         
         # 准备TTS请求参数
         request = {
@@ -186,10 +324,19 @@ async def text_to_speech_optimized(text, tts_model, ref_audio_path, audio_dir):
         
         # 运行TTS推理
         logger.info(f"开始GPT-SoVITS语音合成: 文本长度={len(text)}")
-        generator = tts_model.run(request)
         
-        # 获取生成的音频
-        sr, audio_data = next(generator)
+        # 运行GPT-SoVITS，使用超时处理
+        try:
+            generator = tts_model.run(request)
+            sr, audio_data = await asyncio.wait_for(
+                asyncio.to_thread(next, generator),
+                timeout=10.0  # 最多等待10秒
+            )
+        except asyncio.TimeoutError:
+            logger.error("GPT-SoVITS处理超时")
+            # 创建空音频作为后备
+            audio_data = np.zeros(16000, dtype=np.float32)  # 1秒静音
+            sr = 16000
         
         # 保存为WAV文件
         sf.write(wavfile_path, audio_data, sr)
@@ -198,10 +345,58 @@ async def text_to_speech_optimized(text, tts_model, ref_audio_path, audio_dir):
         logger.info(f"GPT-SoVITS处理完成，耗时: {total_time:.2f}秒")
         
         # 将int16格式转换为float32用于进一步处理
-        audio_np = audio_data.astype(np.float32) / 32768.0
+        if audio_data.dtype != np.float32:
+            audio_np = audio_data.astype(np.float32) / 32768.0
+        else:
+            audio_np = audio_data
         
         return audio_np, wavfile_path
             
     except Exception as e:
         logger.error(f"TTS处理错误: {e}")
+        import traceback
+        traceback.print_exc()
         return None, None
+
+# 其他辅助函数保持不变...
+def detect_language(text):
+    """检测文本的主要语言"""
+    if not text:
+        return 'zh'  # 默认中文
+    
+    # 计算各种语言的字符数量
+    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
+    english_chars = len(re.findall(r'[a-zA-Z]', text))
+    japanese_chars = len(re.findall(r'[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]', text)) - chinese_chars
+    
+    # 返回占比最高的语言
+    if chinese_chars >= english_chars and chinese_chars >= japanese_chars:
+        return 'zh'
+    elif english_chars >= chinese_chars and english_chars >= japanese_chars:
+        return 'en'
+    else:
+        return 'ja'
+
+def preprocess_text(text):
+    """对文本进行预处理"""
+    if not text:
+        return ""
+    
+    # 标准化空白字符
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    # 标准化常见标点
+    text = text.replace('，', '，').replace(',', '，')
+    text = text.replace('。', '。').replace('.', '。')
+    text = text.replace('？', '？').replace('?', '？')
+    text = text.replace('！', '！').replace('!', '！')
+    
+    # 处理省略号
+    text = re.sub(r'\.{3,}', '……', text)
+    text = re.sub(r'。{2,}', '……', text)
+    
+    # 移除HTML和Markdown标记
+    text = re.sub(r'<[^>]+>', '', text)
+    text = re.sub(r'\[.*?\]', '', text)
+    
+    return text

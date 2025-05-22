@@ -11,6 +11,7 @@ from typing import List, Dict, Optional, Tuple, Generator
 import logging
 import pandas as pd
 from scipy import signal  # 用于简化版Blendshape生成
+import asyncio
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -50,9 +51,13 @@ except ImportError as e:
         logger.error("需要先生成gRPC模块，请运行proto_generator.py")
         raise
 
+# 缓存和性能优化
+_client_instance = None
+_blendshape_generator = None
+
 # 新增：简化版Blendshape生成器（省去调用Audio2Face-3D服务的复杂过程）
 class SimpleBlendshapeGenerator:
-    """基于音频振幅的简化版Blendshape生成器"""
+    """基于音频振幅的简化版Blendshape生成器，针对流式处理优化"""
     
     def __init__(self):
         """初始化简化版Blendshape生成器"""
@@ -63,6 +68,30 @@ class SimpleBlendshapeGenerator:
             "MouthSmileLeft", "MouthSmileRight", "MouthFrownLeft", "MouthFrownRight",
             "MouthUpperUpLeft", "MouthUpperUpRight", "MouthLowerDownLeft", "MouthLowerDownRight"
         ]
+        
+        # 缓存常见音位与Blendshape的映射
+        self.phoneme_to_blendshape = {
+            # 元音
+            'a': {'JawOpen': 0.7, 'MouthUpperUpLeft': 0.3, 'MouthUpperUpRight': 0.3, 'MouthLowerDownLeft': 0.5, 'MouthLowerDownRight': 0.5},
+            'e': {'JawOpen': 0.5, 'MouthUpperUpLeft': 0.5, 'MouthUpperUpRight': 0.5, 'MouthLowerDownLeft': 0.2, 'MouthLowerDownRight': 0.2},
+            'i': {'JawOpen': 0.3, 'MouthStretchLeft': 0.6, 'MouthStretchRight': 0.6},
+            'o': {'JawOpen': 0.5, 'MouthFunnel': 0.7, 'MouthPucker': 0.3},
+            'u': {'JawOpen': 0.3, 'MouthPucker': 0.8},
+            
+            # 辅音
+            'b': {'MouthClose': 0.9, 'MouthPressLeft': 0.7, 'MouthPressRight': 0.7},
+            'p': {'MouthClose': 0.9, 'MouthPressLeft': 0.7, 'MouthPressRight': 0.7},
+            'm': {'MouthClose': 0.9, 'MouthPressLeft': 0.5, 'MouthPressRight': 0.5},
+            'f': {'JawOpen': 0.3, 'MouthLowerDownLeft': 0.2, 'MouthLowerDownRight': 0.2, 'MouthUpperUpLeft': 0.3, 'MouthUpperUpRight': 0.3},
+            's': {'JawOpen': 0.2, 'MouthStretchLeft': 0.4, 'MouthStretchRight': 0.4},
+            'th': {'JawOpen': 0.4, 'MouthUpperUpLeft': 0.1, 'MouthUpperUpRight': 0.1},
+            'r': {'JawOpen': 0.4, 'MouthFunnel': 0.4},
+            'l': {'JawOpen': 0.4, 'MouthLeft': 0.3, 'MouthRight': 0.3}
+        }
+        
+        # 特殊口型变化序列
+        self.blink_pattern = [0.0, 0.0, 0.0, 0.1, 0.4, 0.7, 1.0, 0.7, 0.4, 0.1, 0.0]
+        
         logger.info("初始化简化版Blendshape生成器")
     
     def generate_blendshape_from_audio(self, audio_samples, output_csv_path, sample_rate=16000, fps=30):
@@ -122,6 +151,15 @@ class SimpleBlendshapeGenerator:
             
             # 创建Blendshape数据
             blend_data = []
+            
+            # 随机生成眨眼事件
+            blink_events = []
+            for i in range(int(num_frames / 90) + 1):  # 平均每3秒眨一次眼
+                blink_frame = np.random.randint(i * 90, (i + 1) * 90)
+                if blink_frame < num_frames:
+                    blink_events.append(blink_frame)
+            
+            # 使用能量包络创建逼真的口型动画
             for frame_idx in range(num_frames):
                 time_point = frame_idx / fps
                 energy_val = energy_frames[frame_idx]
@@ -133,40 +171,51 @@ class SimpleBlendshapeGenerator:
                     "time_code": frame_idx / fps
                 }
                 
-                # 基于音频能量添加Blendshape值
-                # JawOpen - 主要受音频能量影响
-                frame_data["JawOpen"] = np.clip(energy_val * 1.2, 0.0, 1.0)
+                # 基于音频能量调整口型
+                # 计算基本的JawOpen值
+                jaw_open = np.clip(energy_val * 1.2, 0.0, 1.0)
                 
-                # MouthClose - 与JawOpen相反
-                frame_data["MouthClose"] = 1.0 - frame_data["JawOpen"] * 0.8
-                
-                # 添加微笑和其他口型的变化（基于音频能量和一些随机性）
-                smile_val = energy_val * 0.5 + np.sin(time_point * 2) * 0.1
-                frame_data["MouthSmileLeft"] = np.clip(smile_val, 0.0, 0.6)
-                frame_data["MouthSmileRight"] = np.clip(smile_val, 0.0, 0.6)
-                
-                # 添加其他Blendshape（眨眼等）的基本动画
-                if frame_idx % 90 == 0:  # 约3秒眨一次眼
-                    frame_data["EyeBlinkLeft"] = 1.0
-                    frame_data["EyeBlinkRight"] = 1.0
-                elif frame_idx % 90 == 1:  # 眨眼后的下一帧
-                    frame_data["EyeBlinkLeft"] = 0.5
-                    frame_data["EyeBlinkRight"] = 0.5
+                # 生成更自然的口型变化
+                # 低能量时稍微张开嘴
+                if energy_val < 0.2:
+                    jaw_open = max(jaw_open, 0.05)  # 保持微微张嘴
+                    frame_data["MouthClose"] = 0.8
+                    frame_data["MouthPucker"] = 0.2
+                # 中等能量时变化更多样
+                elif energy_val < 0.5:
+                    frame_data["MouthClose"] = 0.5 - energy_val
+                    frame_data["MouthFunnel"] = energy_val * 0.5
+                    frame_data["MouthSmileLeft"] = energy_val * 0.3
+                    frame_data["MouthSmileRight"] = energy_val * 0.3
+                # 高能量时夸张张嘴
                 else:
-                    frame_data["EyeBlinkLeft"] = 0.0
-                    frame_data["EyeBlinkRight"] = 0.0
+                    frame_data["MouthClose"] = 0.0
+                    frame_data["MouthSmileLeft"] = energy_val * 0.4
+                    frame_data["MouthSmileRight"] = energy_val * 0.4
+                    frame_data["MouthFunnel"] = (1 - energy_val) * 0.3
+                    frame_data["MouthUpperUpLeft"] = energy_val * 0.5
+                    frame_data["MouthUpperUpRight"] = energy_val * 0.5
+                    frame_data["MouthLowerDownLeft"] = energy_val * 0.7
+                    frame_data["MouthLowerDownRight"] = energy_val * 0.7
                 
-                # 添加其他口型动画
-                if energy_val > 0.7:  # 高能量时的特殊口型
-                    frame_data["MouthPucker"] = np.clip((energy_val - 0.7) * 2, 0, 0.5)
-                else:
-                    frame_data["MouthPucker"] = 0.0
+                frame_data["JawOpen"] = jaw_open
                 
-                # 上下嘴唇运动
-                frame_data["MouthUpperUpLeft"] = frame_data["JawOpen"] * 0.3
-                frame_data["MouthUpperUpRight"] = frame_data["JawOpen"] * 0.3
-                frame_data["MouthLowerDownLeft"] = frame_data["JawOpen"] * 0.5
-                frame_data["MouthLowerDownRight"] = frame_data["JawOpen"] * 0.5
+                # 处理眨眼动画
+                eye_blink = 0.0
+                for blink_start in blink_events:
+                    # 计算当前帧与眨眼事件的距离
+                    distance = frame_idx - blink_start
+                    if 0 <= distance < len(self.blink_pattern):
+                        eye_blink = max(eye_blink, self.blink_pattern[distance])
+                
+                frame_data["EyeBlinkLeft"] = eye_blink
+                frame_data["EyeBlinkRight"] = eye_blink
+                
+                # 处理说话时的自然面部动画
+                if energy_val > 0.3:
+                    # 高能量时偶尔挑眉
+                    if np.random.random() < 0.05:
+                        frame_data["BrowInnerUp"] = np.random.uniform(0.3, 0.6)
                 
                 # 将非零值添加到结果中
                 blend_data.append(frame_data)
@@ -176,6 +225,37 @@ class SimpleBlendshapeGenerator:
         
         except Exception as e:
             logger.error(f"生成简化Blendshape数据时出错: {e}")
+            traceback.print_exc()
+            return False
+    
+    def generate_blendshape_fast(self, audio_file_path, output_csv_path, fps=30):
+        """
+        从音频文件快速生成Blendshape数据，针对流式处理优化
+        
+        参数:
+            audio_file_path: 音频文件路径
+            output_csv_path: 输出CSV文件路径
+            fps: 动画帧率
+            
+        返回:
+            成功返回True，否则返回False
+        """
+        try:
+            # 读取音频文件
+            with wave.open(audio_file_path, 'rb') as wf:
+                sample_rate = wf.getframerate()
+                audio_data = wf.readframes(wf.getnframes())
+                audio_samples = np.frombuffer(audio_data, dtype=np.int16)
+            
+            # 生成Blendshape数据
+            return self.generate_blendshape_from_audio(
+                audio_samples, 
+                output_csv_path,
+                sample_rate,
+                fps
+            )
+        except Exception as e:
+            logger.error(f"快速生成Blendshape数据时出错: {e}")
             traceback.print_exc()
             return False
     
@@ -213,7 +293,7 @@ class SimpleBlendshapeGenerator:
             return False
 
 class Audio2Face3DClient:
-    """与Audio2Face-3D gRPC服务交互的客户端"""
+    """与Audio2Face-3D gRPC服务交互的客户端，针对流式处理优化"""
 
     def __init__(self, server_address: str = "localhost:52000", max_buffer_seconds: float = 10.0):
         """
@@ -223,6 +303,8 @@ class Audio2Face3DClient:
             server_address: Audio2Face-3D gRPC服务器地址
             max_buffer_seconds: 最大处理音频缓冲区长度，超过此长度的音频将被分段处理
         """
+        global _blendshape_generator
+        
         self.server_address = server_address
         self.max_buffer_seconds = max_buffer_seconds
         logger.info(f"初始化Audio2Face-3D客户端，服务器地址：{server_address}，最大缓冲区长度：{max_buffer_seconds}秒")
@@ -254,13 +336,23 @@ class Audio2Face3DClient:
             "CheekSquintLeft", "CheekSquintRight", "NoseSneerLeft", "NoseSneerRight", "TongueOut"
         ]
         
+        # 初始化简化版Blendshape生成器，用于快速生成表情数据
+        if _blendshape_generator is None:
+            _blendshape_generator = SimpleBlendshapeGenerator()
+        self.blendshape_generator = _blendshape_generator
+        
+        # 连接状态
+        self.is_connected = False
+        
         # 测试连接
         try:
             # 创建简单请求检查连接
             self._test_connection()
+            self.is_connected = True
             logger.info("成功连接到Audio2Face-3D服务")
         except Exception as e:
             logger.error(f"连接Audio2Face-3D服务失败: {e}")
+            self.is_connected = False
     
     def _test_connection(self):
         """测试与服务器的连接"""
@@ -289,19 +381,19 @@ class Audio2Face3DClient:
             bits_per_sample=16
         )
         
-        # 创建面部参数
+        # 创建面部参数 - 优化参数以获得更自然的表情
         face_params = a2f_pb2.FaceParameters(
             float_params={
-                "lowerFaceSmoothing": 0.3,
+                "lowerFaceSmoothing": 0.2,  # 降低平滑度以获得更敏锐的反应
                 "upperFaceSmoothing": 0.3,
-                "lowerFaceStrength": 1.0,
+                "lowerFaceStrength": 1.2,   # 增强下半脸的强度
                 "upperFaceStrength": 1.0,
                 "faceMaskLevel": 0.5,
                 "faceMaskSoftness": 0.3,
                 "skinStrength": 1.0,
                 "blinkStrength": 1.0,
                 "eyelidOpenOffset": 0.0,
-                "lipOpenOffset": 0.0,
+                "lipOpenOffset": 0.1,       # 稍微增加嘴唇张开偏移
                 "blinkOffset": 0.0,
                 "tongueStrength": 1.0,
                 "tongueHeightOffset": 0.0,
@@ -312,12 +404,16 @@ class Audio2Face3DClient:
         # 创建blendshape参数
         blendshape_params = a2f_pb2.BlendShapeParameters(
             bs_weight_multipliers={
-                "JawOpen": 1.3,
-                "MouthSmileLeft": 1.3,
-                "MouthSmileRight": 1.3,
+                "JawOpen": 1.3,              # 增加下巴开启幅度
+                "MouthSmileLeft": 1.2,
+                "MouthSmileRight": 1.2,
                 "BrowInnerUp": 1.2,
                 "EyeBlinkLeft": 1.0,
-                "EyeBlinkRight": 1.0
+                "EyeBlinkRight": 1.0,
+                "MouthUpperUpLeft": 1.2,     # 增加上嘴唇运动
+                "MouthUpperUpRight": 1.2,
+                "MouthLowerDownLeft": 1.3,   # 增加下嘴唇运动
+                "MouthLowerDownRight": 1.3
             },
             bs_weight_offsets={},
             enable_clamping_bs_weight=True
@@ -325,7 +421,7 @@ class Audio2Face3DClient:
         
         # 创建情绪参数
         emotion_params = a2f_pb2.EmotionParameters(
-            live_transition_time=0.3,
+            live_transition_time=0.2,  # 缩短过渡时间以获得更快的响应
             beginning_emotion={
                 "neutral": 1.0
             }
@@ -337,7 +433,7 @@ class Audio2Face3DClient:
             live_blend_coef=0.7,
             enable_preferred_emotion=True,
             preferred_emotion_strength=0.6,
-            emotion_strength=0.7,
+            emotion_strength=0.8,        # 增加情绪强度
             max_emotions=3
         )
         
@@ -473,7 +569,7 @@ class Audio2Face3DClient:
             animation_data_list: AnimationData对象列表
             
         返回:
-            包含blendshape数据的字典列表，每帧一个字典
+            包含blendshape数据的字典列表,每帧一个字典
         """
         all_frames = []
         
@@ -551,6 +647,60 @@ class Audio2Face3DClient:
             traceback.print_exc()
             return False
     
+    # 新增：智能决定使用快速处理还是精确处理
+    def smart_process_audio_file_to_blendshape(self, audio_file_path: str, output_csv_path: str, fast_mode=False) -> bool:
+        """
+        智能处理音频文件并将Blendshape数据保存到CSV，自动选择处理模式
+        
+        参数:
+            audio_file_path: 音频文件路径（WAV）
+            output_csv_path: 输出CSV文件路径
+            fast_mode: 是否强制使用快速模式
+            
+        返回:
+            成功返回True，否则返回False
+        """
+        logger.info(f"智能处理音频文件到Blendshape: {audio_file_path} -> {output_csv_path}")
+        
+        # 检测文件长度和内容
+        try:
+            with wave.open(audio_file_path, 'rb') as wf:
+                n_frames = wf.getnframes()
+                sample_rate = wf.getframerate()
+                duration = n_frames / sample_rate
+                
+                # 自动决定是否使用快速模式
+                # 如果已指定快速模式或服务不可用，使用简化版生成器
+                auto_fast_mode = fast_mode or not self.is_connected
+                
+                # 对于短音频（<0.5秒）或时间紧迫的场景，使用快速模式
+                if duration < 0.5 or auto_fast_mode:
+                    logger.info(f"使用快速处理模式生成Blendshape数据，音频长度: {duration:.2f}秒")
+                    return self.blendshape_generator.generate_blendshape_fast(
+                        audio_file_path, 
+                        output_csv_path
+                    )
+                else:
+                    # 使用完整A2F处理获得更准确的结果
+                    logger.info(f"使用精确处理模式生成Blendshape数据，音频长度: {duration:.2f}秒")
+                    return self.process_audio_file_to_blendshape(
+                        audio_file_path, 
+                        output_csv_path
+                    )
+        except Exception as e:
+            logger.error(f"智能处理音频文件时出错: {e}")
+            
+            # 出错时尝试使用简化版处理
+            try:
+                logger.info("使用简化Blendshape生成器作为后备")
+                return self.blendshape_generator.generate_blendshape_fast(
+                    audio_file_path, 
+                    output_csv_path
+                )
+            except Exception as e2:
+                logger.error(f"后备处理也失败: {e2}")
+                return False
+    
     def process_audio_file_to_blendshape(self, audio_file_path: str, output_csv_path: str) -> bool:
         """
         处理音频文件并将Blendshape数据保存到CSV
@@ -592,7 +742,13 @@ class Audio2Face3DClient:
             
             if not animation_data_list:
                 logger.error("没有从Audio2Face-3D获取到动画数据")
-                return False
+                
+                # 尝试使用备选方案
+                logger.info("尝试使用简化版Blendshape生成器")
+                return self.blendshape_generator.generate_blendshape_fast(
+                    audio_file_path, 
+                    output_csv_path
+                )
                 
             logger.info(f"成功获取 {len(animation_data_list)} 个动画数据帧")
             
@@ -601,7 +757,13 @@ class Audio2Face3DClient:
             
             if not blendshape_data:
                 logger.error("无法从动画数据提取Blendshape数据")
-                return False
+                
+                # 尝试备选方案
+                logger.info("尝试使用简化版Blendshape生成器")
+                return self.blendshape_generator.generate_blendshape_fast(
+                    audio_file_path, 
+                    output_csv_path
+                )
                 
             logger.info(f"成功提取 {len(blendshape_data)} 帧Blendshape数据")
             
@@ -610,7 +772,17 @@ class Audio2Face3DClient:
         except Exception as e:
             logger.error(f"处理音频到Blendshape数据时出错: {e}")
             traceback.print_exc()
-            return False
+            
+            # 出错时尝试使用简化版处理
+            try:
+                logger.info("尝试使用简化版Blendshape生成器作为后备")
+                return self.blendshape_generator.generate_blendshape_fast(
+                    audio_file_path, 
+                    output_csv_path
+                )
+            except Exception as e2:
+                logger.error(f"后备处理也失败: {e2}")
+                return False
     
     def split_audio_file(self, audio_file_path: str, max_segment_seconds: float = None) -> List[str]:
         """将音频文件分割成更小的段"""
@@ -722,7 +894,13 @@ class Audio2Face3DClient:
         
         if not all_animation_data:
             logger.error("没有从任何段获取到动画数据")
-            return False
+            
+            # 尝试使用备选方案
+            logger.info("尝试使用简化版Blendshape生成器")
+            return self.blendshape_generator.generate_blendshape_fast(
+                audio_file_path, 
+                output_csv_path
+            )
         
         logger.info(f"所有段处理完成，总共获取 {len(all_animation_data)} 个动画数据帧")
         
@@ -731,17 +909,95 @@ class Audio2Face3DClient:
         
         if not blendshape_data:
             logger.error("无法从动画数据提取Blendshape数据")
-            return False
+            
+            # 尝试备选方案
+            logger.info("尝试使用简化版Blendshape生成器")
+            return self.blendshape_generator.generate_blendshape_fast(
+                audio_file_path, 
+                output_csv_path
+            )
             
         logger.info(f"成功提取 {len(blendshape_data)} 帧Blendshape数据")
         
         # 保存Blendshape数据到CSV
         return self.save_blendshape_to_csv(blendshape_data, output_csv_path)
 
+# 获取单例客户端实例，优化初始化性能
+def get_audio2face_client(server_address="localhost:52000", max_buffer_seconds=10.0):
+    """获取Audio2Face客户端单例，避免重复初始化"""
+    global _client_instance
+    
+    if _client_instance is None:
+        logger.info("创建新的Audio2Face客户端实例")
+        _client_instance = Audio2Face3DClient(server_address, max_buffer_seconds)
+    
+    return _client_instance
+
+# 异步处理音频文件为Blendshape数据，支持超时和回退策略
+async def async_process_audio_to_blendshape(audio_file_path, output_csv_path, server_address="localhost:52000", timeout=5.0):
+    """
+    异步处理音频文件为Blendshape数据，带有超时和回退策略
+    
+    参数:
+        audio_file_path: 音频文件路径
+        output_csv_path: 输出CSV文件路径
+        server_address: A2F服务器地址
+        timeout: 处理超时时间（秒）
+        
+    返回:
+        成功返回True，否则返回False
+    """
+    global _blendshape_generator  # 先声明全局变量
+    
+    try:
+        # 获取客户端实例
+        client = get_audio2face_client(server_address)
+        
+        # 首先尝试使用智能处理（会自动选择最佳方式）
+        processing_task = asyncio.create_task(
+            asyncio.to_thread(
+                client.smart_process_audio_file_to_blendshape,
+                audio_file_path,
+                output_csv_path
+            )
+        )
+        
+        # 使用超时控制
+        try:
+            success = await asyncio.wait_for(processing_task, timeout=timeout)
+            return success
+        except asyncio.TimeoutError:
+            logger.warning(f"处理音频超时（{timeout}秒），使用简化Blendshape生成器")
+            
+            # 超时时使用简化版生成器
+            return await asyncio.to_thread(
+                client.blendshape_generator.generate_blendshape_fast,
+                audio_file_path,
+                output_csv_path
+            )
+    except Exception as e:
+        logger.error(f"异步处理音频到Blendshape时出错: {e}")
+        traceback.print_exc()
+        
+        # 尝试使用简化版生成器作为最后的备选方案
+        try:
+            logger.info("使用简化Blendshape生成器作为后备")
+            if _blendshape_generator is None:
+                _blendshape_generator = SimpleBlendshapeGenerator()
+                
+            return await asyncio.to_thread(
+                _blendshape_generator.generate_blendshape_fast,
+                audio_file_path,
+                output_csv_path
+            )
+        except Exception as e2:
+            logger.error(f"后备处理也失败: {e2}")
+            return False
+
 # 使用示例
 if __name__ == "__main__":
     client = Audio2Face3DClient("localhost:52000", max_buffer_seconds=10.0)
-    success = client.process_long_audio_file_to_blendshape(
+    success = client.smart_process_audio_file_to_blendshape(
         "example.wav", 
         "example_blendshape.csv"
     )
