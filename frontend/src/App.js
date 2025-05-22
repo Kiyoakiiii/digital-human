@@ -6,7 +6,7 @@ import { MeshStandardMaterial } from 'three/src/materials/MeshStandardMaterial';
 import { LinearEncoding, sRGBEncoding } from 'three/src/constants';
 import { LineBasicMaterial, MeshPhysicalMaterial, Vector2 } from 'three';
 
-import createAnimation from './converter';
+import createAnimation, { resetAnimationState } from './converter';
 import blinkData from './blendDataBlink.json';
 
 import * as THREE from 'three';
@@ -27,15 +27,16 @@ let clientId = 'client_' + Math.random().toString(36).substr(2, 9);
 let mediaRecorder = null;
 let audioChunks = [];
 
-// 保持Avatar完整实现，但增加了处理连续动画的能力
-function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setResponse, setAnimReady, animationData, setAudioElement, isAudioPlaying }) {
+// 修改Avatar组件以支持流式动画处理
+function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setResponse, setAnimReady, animationData, setAudioElement, isAudioPlaying, currentSegmentIndex }) {
   let gltf = useGLTF(avatar_url);
   let morphTargetDictionaryBody = null;
   let morphTargetDictionaryLowerTeeth = null;
   const mixerRef = useRef(null);
   
-  // 新增：存储当前活动的clips以便可以管理多个动画
+  // 存储当前活动的动画clips
   const activeClipsRef = useRef([]);
+  const segmentClipsRef = useRef(new Map()); // 存储每个片段的clips
 
   const [
     bodyTexture,
@@ -165,41 +166,13 @@ function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setRes
     }
   });
 
-  // 修改：使用ref存储多个clips，支持流式处理
-  const [baseClips, setBaseClips] = useState([]);
   const mixer = useMemo(() => {
     const newMixer = new THREE.AnimationMixer(gltf.scene);
     mixerRef.current = newMixer;
     return newMixer;
   }, []);
 
-  // 当clips变化时，通知App组件动画状态
-  useEffect(() => {
-    if (setAnimReady) {
-      setAnimReady(baseClips.length > 0);
-    }
-  }, [baseClips, setAnimReady]);
-
-  // 修改：处理新的动画数据片段
-  useEffect(() => {
-    if (animationData && animationData.blendData) {
-      console.log("处理新动画数据片段，帧数:", animationData.blendData.length);
-
-      // 创建动画剪辑
-      const newClips = [
-        createAnimation(animationData.blendData, morphTargetDictionaryBody, 'HG_Body'),
-        createAnimation(animationData.blendData, morphTargetDictionaryLowerTeeth, 'HG_TeethLower')
-      ].filter(clip => clip !== null);
-
-      if (newClips.length > 0) {
-        console.log("动画剪辑已创建:", newClips.map(c => c.tracks.length + "个轨道"));
-        // 将新创建的clips添加到当前活动clips中
-        activeClipsRef.current = [...activeClipsRef.current, ...newClips];
-        setBaseClips(prev => [...prev, ...newClips]);
-      }
-    }
-  }, [animationData]);
-
+  // 设置基础动画（眨眼和闲置动画）
   let idleFbx = useFBX('/idle.fbx');
   let { clips: idleClips } = useAnimations(idleFbx.animations);
 
@@ -223,61 +196,107 @@ function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setRes
     return track;
   });
 
-  // 设置基础动画
+  // 初始化基础动画
   useEffect(() => {
+    if (!mixer || !morphTargetDictionaryBody) return;
+
     let idleClipAction = mixer.clipAction(idleClips[0]);
     idleClipAction.play();
 
-    let blinkClip = createAnimation(blinkData, morphTargetDictionaryBody, 'HG_Body');
-    let blinkAction = mixer.clipAction(blinkClip);
-    blinkAction.play();
-  }, []);
+    let blinkClip = createAnimation(blinkData, morphTargetDictionaryBody, 'HG_Body', false);
+    if (blinkClip) {
+      let blinkAction = mixer.clipAction(blinkClip);
+      blinkAction.play();
+    }
 
-  // 修改：流式播放动画
+    setAnimReady(true);
+  }, [mixer, morphTargetDictionaryBody]);
+
+  // 处理新的动画数据 - 关键修改点
   useEffect(() => {
-    if (playing === false || !baseClips || baseClips.length === 0)
+    if (!animationData || !animationData.blendData || !morphTargetDictionaryBody || !morphTargetDictionaryLowerTeeth) {
       return;
+    }
 
-    console.log("播放流式动画，当前活动动画数量:", activeClipsRef.current.length);
+    console.log("处理新动画数据片段，帧数:", animationData.blendData.length);
+    console.log("动画数据示例:", animationData.blendData.slice(0, 2));
 
-    // 播放最近添加的动画剪辑
-    const latestClips = activeClipsRef.current.slice(-2); // 获取最新添加的两个clip (身体和牙齿)
-    
-    _.each(latestClips, clip => {
-      if (clip && clip.tracks && clip.tracks.length > 0) {
-        let clipAction = mixer.clipAction(clip);
-        clipAction.setLoop(THREE.LoopOnce);
-        clipAction.clampWhenFinished = true; // 动画结束时保持最后一帧
-        clipAction.play();
-        console.log("播放动画剪辑，轨道数:", clip.tracks.length);
-      }
-    });
-  }, [playing, animationData]);
-
-  // 停止所有动画并重置
-  const resetAllAnimations = useCallback(() => {
-    // 停止所有当前播放的表情动画
-    _.each(activeClipsRef.current, clip => {
-      if (clip && clip.tracks && clip.tracks.length > 0) {
-        const action = mixerRef.current.existingAction(clip);
+    try {
+      // 停止之前的表情动画（保留基础动画）
+      activeClipsRef.current.forEach(clip => {
+        const action = mixer.existingAction(clip);
         if (action) {
           action.stop();
+          action.reset();
         }
+      });
+
+      // 创建新的动画剪辑
+      const bodyClip = createAnimation(animationData.blendData, morphTargetDictionaryBody, 'HG_Body', true);
+      const teethClip = createAnimation(animationData.blendData, morphTargetDictionaryLowerTeeth, 'HG_TeethLower', true);
+
+      const newClips = [bodyClip, teethClip].filter(clip => clip !== null);
+
+      if (newClips.length > 0) {
+        console.log("动画剪辑已创建:", newClips.map(c => `${c.tracks.length}个轨道`));
+        
+        // 存储新的活动clips
+        activeClipsRef.current = newClips;
+
+        // 播放新的动画
+        newClips.forEach(clip => {
+          if (clip && clip.tracks && clip.tracks.length > 0) {
+            const clipAction = mixer.clipAction(clip);
+            clipAction.setLoop(THREE.LoopOnce);
+            clipAction.clampWhenFinished = true;
+            clipAction.reset();
+            clipAction.play();
+            
+            console.log(`播放动画剪辑: ${clip.tracks.length}个轨道, 持续时间: ${clip.duration.toFixed(2)}秒`);
+          }
+        });
+      } else {
+        console.warn("无法创建动画剪辑");
+      }
+    } catch (error) {
+      console.error("处理动画数据时出错:", error);
+    }
+  }, [animationData, mixer, morphTargetDictionaryBody, morphTargetDictionaryLowerTeeth]);
+
+  // 重置动画状态
+  const resetAllAnimations = useCallback(() => {
+    console.log("重置所有动画");
+    
+    // 停止所有表情动画
+    activeClipsRef.current.forEach(clip => {
+      const action = mixer.existingAction(clip);
+      if (action) {
+        action.stop();
+        action.reset();
       }
     });
 
     // 清空活动动画列表
     activeClipsRef.current = [];
-    setBaseClips([]);
+    segmentClipsRef.current.clear();
+
+    // 重置动画状态
+    resetAnimationState();
 
     // 确保基础动画继续播放
-    let idleClipAction = mixerRef.current.clipAction(idleClips[0]);
-    idleClipAction.play();
+    if (idleClips[0]) {
+      let idleClipAction = mixer.clipAction(idleClips[0]);
+      idleClipAction.play();
+    }
 
-    let blinkClip = createAnimation(blinkData, morphTargetDictionaryBody, 'HG_Body');
-    let blinkAction = mixerRef.current.clipAction(blinkClip);
-    blinkAction.play();
-  }, [mixer, idleClips]);
+    if (morphTargetDictionaryBody) {
+      let blinkClip = createAnimation(blinkData, morphTargetDictionaryBody, 'HG_Body', false);
+      if (blinkClip) {
+        let blinkAction = mixer.clipAction(blinkClip);
+        blinkAction.play();
+      }
+    }
+  }, [mixer, idleClips, morphTargetDictionaryBody]);
 
   // 监听播放状态变化
   useEffect(() => {
@@ -288,7 +307,9 @@ function Avatar({ avatar_url, speak, setSpeak, text, playing, setPlaying, setRes
   }, [isAudioPlaying, resetAllAnimations]);
 
   useFrame((state, delta) => {
-    mixer.update(delta);
+    if (mixer) {
+      mixer.update(delta);
+    }
   });
 
   return (
@@ -545,7 +566,7 @@ function App() {
   const [conversation, setConversation] = useState([]);
   const [wsReady, setWsReady] = useState(false);
   
-  // 新增：流式音频处理状态
+  // 流式音频处理状态
   const [audioQueue, setAudioQueue] = useState([]);
   const [isAudioPlaying, setIsAudioPlaying] = useState(false);
   const [currentAudioIndex, setCurrentAudioIndex] = useState(0);
@@ -694,9 +715,12 @@ function App() {
     setPlaying(false);
     setAnimationData(null);
     setStatusMessage("");
+    
+    // 重置动画状态
+    resetAnimationState();
   }, []);
 
-  // 新增：处理流式音频队列
+  // 处理流式音频队列
   useEffect(() => {
     // 当有新的音频添加到队列时，检查是否需要开始播放
     if (audioQueue.length > 0 && !isAudioPlaying && currentAudioIndex < audioQueue.length) {
@@ -710,22 +734,37 @@ function App() {
       audio.oncanplay = () => {
         console.log(`音频片段 ${currentAudioIndex+1} 已加载，准备播放`);
         
-        // 设置动画数据
-        if (currentSegment.blendData) {
+        // 关键修改：先设置动画数据，再播放音频
+        if (currentSegment.blendData && currentSegment.blendData.length > 0) {
+          console.log(`设置动画数据，帧数: ${currentSegment.blendData.length}`);
           setAnimationData({ blendData: currentSegment.blendData });
           setPlaying(true);
+          
+          // 稍微延迟播放音频，确保动画已设置
+          setTimeout(() => {
+            audio.play()
+              .then(() => {
+                console.log(`开始播放音频片段 ${currentAudioIndex+1}`);
+                setIsAudioPlaying(true);
+              })
+              .catch(error => {
+                console.error(`播放音频片段 ${currentAudioIndex+1} 失败:`, error);
+                playNextAudio();
+              });
+          }, 50);
+        } else {
+          console.warn(`音频片段 ${currentAudioIndex+1} 没有动画数据`);
+          // 即使没有动画数据也播放音频
+          audio.play()
+            .then(() => {
+              console.log(`开始播放音频片段 ${currentAudioIndex+1} (无动画)`);
+              setIsAudioPlaying(true);
+            })
+            .catch(error => {
+              console.error(`播放音频片段 ${currentAudioIndex+1} 失败:`, error);
+              playNextAudio();
+            });
         }
-        
-        // 播放音频
-        audio.play()
-          .then(() => {
-            console.log(`开始播放音频片段 ${currentAudioIndex+1}`);
-            setIsAudioPlaying(true);
-          })
-          .catch(error => {
-            console.error(`播放音频片段 ${currentAudioIndex+1} 失败:`, error);
-            playNextAudio();
-          });
       };
       
       // 当前音频播放结束时
@@ -753,11 +792,11 @@ function App() {
     // 更新索引
     setCurrentAudioIndex(prev => prev + 1);
     setIsAudioPlaying(false);
-    
+
     // 检查是否所有片段都已播放完毕
     if (currentAudioIndex + 1 >= audioQueue.length) {
       console.log("所有音频片段播放完毕");
-      
+     
       // 所有片段播放完毕
       if (!processingRef.current) {
         // 没有更多待处理的片段，完全结束
@@ -770,326 +809,359 @@ function App() {
     }
   }, [currentAudioIndex, audioQueue.length]);
 
-  // 初始化WebSocket
-  useEffect(() => {
-    const ws = setupWebSocket(setBackendStatus, setWsReady);
-  }, []);
+ // 初始化WebSocket
+ useEffect(() => {
+   const ws = setupWebSocket(setBackendStatus, setWsReady);
+ }, []);
 
-  // 初始化麦克风
-  useEffect(() => {
-    async function initMic() {
-      const stream = await setupMicrophone(setMicStatus);
-      setMicStream(stream);
-    }
+ // 初始化麦克风
+ useEffect(() => {
+   async function initMic() {
+     const stream = await setupMicrophone(setMicStatus);
+     setMicStream(stream);
+   }
 
-    initMic();
+   initMic();
 
-    // 组件卸载时关闭麦克风
-    return () => {
-      if (micStream) {
-        micStream.getTracks().forEach(track => track.stop());
-      }
-    };
-  }, []);
+   // 组件卸载时关闭麦克风
+   return () => {
+     if (micStream) {
+       micStream.getTracks().forEach(track => track.stop());
+     }
+   };
+ }, []);
 
-  // 设置WebSocket消息处理 - 修改以支持流式处理
-  useEffect(() => {
-    if (websocket) {
-      websocket.onmessage = (event) => {
-        try {
-          const message = JSON.parse(event.data);
-          
-          console.log("收到WebSocket消息类型:", message.type);
-          // 修改：处理流式音频片段
-          if (message.type === "stream_audio_segment") {
-            console.log("收到流式音频片段");
-            
-            // 确保音频URL是完整路径
-            let audioPath = message.filename;
-            if (!audioPath.startsWith('http')) {
-              audioPath = `${host}${audioPath}`;
-            }
-            
-            // 将音频片段添加到队列
-            setAudioQueue(prev => [...prev, {
-              audioUrl: audioPath,
-              blendData: message.blendData,
-              text: message.text
-            }]);
-            
-            // 更新处理状态
-            processingRef.current = message.more_segments;
-            
-            // 更新文本显示
-            if (message.text) {
-              responseTextRef.current += message.text;
-              setResponse(responseTextRef.current);
-              
-              // 如果这是第一个片段，添加到对话历史
-              if (message.is_first_segment) {
-                setConversation(prev => [...prev, {
-                  role: 'assistant',
-                  content: responseTextRef.current
-                }]);
-              } else {
-                // 更新最后一个对话
-                setConversation(prev => {
-                  const newConversation = [...prev];
-                  if (newConversation.length > 0) {
-                    newConversation[newConversation.length - 1] = {
-                      ...newConversation[newConversation.length - 1],
-                      content: responseTextRef.current
-                    };
-                  }
-                  return newConversation;
-                });
-              }
-            }
-            
-            // 更新状态消息
-            if (message.more_segments) {
-              setStatusMessage("处理下一个片段...");
-            } else {
-              setStatusMessage("所有内容已处理完成");
-            }
-          }
-          // 保留对旧消息类型的处理以兼容性
-          else if (message.type === "processing_complete") {
-            console.log("处理完成，获取Blendshape数据和音频");
+ // 设置WebSocket消息处理 - 关键修改点
+ useEffect(() => {
+   if (websocket) {
+     websocket.onmessage = (event) => {
+       try {
+         const message = JSON.parse(event.data);
+         
+         console.log("收到WebSocket消息类型:", message.type);
+         
+         // 处理流式音频片段
+         if (message.type === "stream_audio_segment") {
+           console.log("收到流式音频片段", {
+             segment_index: message.segment_index,
+             is_first_segment: message.is_first_segment,
+             blendData_length: message.blendData ? message.blendData.length : 0,
+             text: message.text
+           });
+           
+           // 确保音频URL是完整路径
+           let audioPath = message.filename;
+           if (!audioPath.startsWith('http')) {
+             audioPath = `${host}${audioPath}`;
+           }
+           
+           // 将音频片段添加到队列
+           setAudioQueue(prev => [...prev, {
+             audioUrl: audioPath,
+             blendData: message.blendData,
+             text: message.text,
+             segmentIndex: message.segment_index
+           }]);
+           
+           // 更新处理状态
+           processingRef.current = true;
+           
+           // 更新文本显示
+           if (message.text) {
+             responseTextRef.current += message.text;
+             setResponse(responseTextRef.current);
+             
+             // 如果这是第一个片段，添加到对话历史
+             if (message.is_first_segment) {
+               setConversation(prev => [...prev, {
+                 role: 'assistant',
+                 content: responseTextRef.current
+               }]);
+             } else {
+               // 更新最后一个对话
+               setConversation(prev => {
+                 const newConversation = [...prev];
+                 if (newConversation.length > 0) {
+                   newConversation[newConversation.length - 1] = {
+                     ...newConversation[newConversation.length - 1],
+                     content: responseTextRef.current
+                   };
+                 }
+                 return newConversation;
+               });
+             }
+           }
+           
+           // 更新状态消息
+           setStatusMessage(`处理片段 ${message.segment_index + 1}...`);
+         }
+         
+         // 处理完成所有片段
+         else if (message.type === "processing_complete_all") {
+           console.log("所有片段处理完成");
+           processingRef.current = false;
+           
+           // 更新最终响应文本
+           if (message.message) {
+             responseTextRef.current = message.message;
+             setResponse(message.message);
+             
+             // 更新对话历史中的最后一条消息
+             setConversation(prev => {
+               const newConversation = [...prev];
+               if (newConversation.length > 0) {
+                 newConversation[newConversation.length - 1] = {
+                   ...newConversation[newConversation.length - 1],
+                   content: message.message
+                 };
+               }
+               return newConversation;
+             });
+           }
+           
+           setStatusMessage("");
+         }
+         
+         // 保留对旧消息类型的处理以兼容性
+         else if (message.type === "processing_complete") {
+           console.log("处理完成，获取Blendshape数据和音频");
 
-            // 确保音频URL是完整路径
-            let audioPath = message.filename;
-            if (!audioPath.startsWith('http')) {
-              audioPath = `${host}${audioPath}`;
-            }
-            console.log("完整音频URL:", audioPath);
+           // 确保音频URL是完整路径
+           let audioPath = message.filename;
+           if (!audioPath.startsWith('http')) {
+             audioPath = `${host}${audioPath}`;
+           }
+           console.log("完整音频URL:", audioPath);
 
-            // 保存动画数据
-            setAnimationData({ blendData: message.blendData });
+           // 保存动画数据
+           if (message.blendData && message.blendData.length > 0) {
+             console.log("设置动画数据，帧数:", message.blendData.length);
+             setAnimationData({ blendData: message.blendData });
+           }
 
-            // 创建音频元素
-            const audio = new Audio(audioPath);
-            audio.oncanplay = () => {
-              console.log("音频已加载，准备播放");
-              audio.play()
-                .then(() => {
-                  console.log("开始播放音频");
-                  setPlaying(true);
-                  setIsAudioPlaying(true);
-                })
-                .catch(error => {
-                  console.error("播放音频失败:", error);
-                });
-            };
+           // 创建音频元素
+           const audio = new Audio(audioPath);
+           audio.oncanplay = () => {
+             console.log("音频已加载，准备播放");
+             audio.play()
+               .then(() => {
+                 console.log("开始播放音频");
+                 setPlaying(true);
+                 setIsAudioPlaying(true);
+               })
+               .catch(error => {
+                 console.error("播放音频失败:", error);
+               });
+           };
 
-            audio.onended = () => {
-              console.log("音频播放结束");
-              setPlaying(false);
-              setIsAudioPlaying(false);
-              setAnimationData(null);
-            };
+           audio.onended = () => {
+             console.log("音频播放结束");
+             setPlaying(false);
+             setIsAudioPlaying(false);
+             setAnimationData(null);
+           };
 
-            currentAudioRef.current = audio;
+           currentAudioRef.current = audio;
 
-            if (message.text) {
-              setResponse(message.text);
-              // 添加到对话历史
-              setConversation(prev => [...prev, {
-                role: 'assistant',
-                content: message.text
-              }]);
-            }
+           if (message.text) {
+             setResponse(message.text);
+             // 添加到对话历史
+             setConversation(prev => [...prev, {
+               role: 'assistant',
+               content: message.text
+             }]);
+           }
 
-            // 重置状态消息
-            setStatusMessage("");
-          }
-          else if (message.type === "ai_response") {
-            console.log("收到AI响应:", message.text);
-            if (message.text) {
-              // 只是更新临时响应，流式片段会更新实际显示
-              setStatusMessage("AI已响应，正在生成语音...");
-            }
-          }
-          else if (message.type === "speech_recognition_result") {
-            console.log("收到语音识别结果:", message.text);
-            if (message.text) {
-              // 添加到对话历史
-              setConversation(prev => [...prev, {
-                role: 'user',
-                content: message.text
-              }]);
-              setStatusMessage("识别完成，等待回复...");
-              
-              // 重置流式处理状态
-              responseTextRef.current = "";
-              setAudioQueue([]);
-              setCurrentAudioIndex(0);
-              processingRef.current = true;
-            } else {
-              setStatusMessage("语音识别结果为空");
-            }
-          }
-          else if (message.type === "processing_status") {
-            // 处理状态更新
-            setStatusMessage(message.message || `正在${message.status}...`);
-          }
-          else if (message.type === "error") {
-            console.error("WebSocket错误:", message.message);
-            alert(`处理时出错: ${message.message}`);
-            setStatusMessage("");
-            
-            // 重置处理状态
-            processingRef.current = false;
-          }
-        } catch (error) {
-          console.error("解析WebSocket消息时出错:", error);
-          setStatusMessage("");
-        }
-      };
-    }
-  }, [websocket]);
+           // 重置状态消息
+           setStatusMessage("");
+         }
+         else if (message.type === "ai_response") {
+           console.log("收到AI响应:", message.text);
+           if (message.text) {
+             setStatusMessage("AI已响应，正在生成语音...");
+           }
+         }
+         else if (message.type === "speech_recognition_result") {
+           console.log("收到语音识别结果:", message.text);
+           if (message.text) {
+             // 添加到对话历史
+             setConversation(prev => [...prev, {
+               role: 'user',
+               content: message.text
+             }]);
+             setStatusMessage("识别完成，等待回复...");
+             
+             // 重置流式处理状态
+             responseTextRef.current = "";
+             setAudioQueue([]);
+             setCurrentAudioIndex(0);
+             processingRef.current = true;
+           } else {
+             setStatusMessage("语音识别结果为空");
+           }
+         }
+         else if (message.type === "processing_status") {
+           // 处理状态更新
+           setStatusMessage(message.message || `正在${message.status}...`);
+         }
+         else if (message.type === "error") {
+           console.error("WebSocket错误:", message.message);
+           alert(`处理时出错: ${message.message}`);
+           setStatusMessage("");
+           
+           // 重置处理状态
+           processingRef.current = false;
+         }
+       } catch (error) {
+         console.error("解析WebSocket消息时出错:", error);
+         setStatusMessage("");
+       }
+     };
+   }
+ }, [websocket]);
 
-  // 检查后端服务状态
-  useEffect(() => {
-    fetch(`${host}/docs`)
-      .then(response => {
-        if(response.ok) {
-          setBackendStatus("REST API已连接");
-          // 如果REST API可用，尝试连接WebSocket
-          setupWebSocket(setBackendStatus, setWsReady);
-        } else {
-          setBackendStatus("后端服务连接失败");
-        }
-      })
-      .catch(err => {
-        console.error("后端服务连接错误:", err);
-        setBackendStatus(`后端服务不可用: ${err.message}`);
-      });
-  }, []);
+ // 检查后端服务状态
+ useEffect(() => {
+   fetch(`${host}/docs`)
+     .then(response => {
+       if(response.ok) {
+         setBackendStatus("REST API已连接");
+         // 如果REST API可用，尝试连接WebSocket
+         setupWebSocket(setBackendStatus, setWsReady);
+       } else {
+         setBackendStatus("后端服务连接失败");
+       }
+     })
+     .catch(err => {
+       console.error("后端服务连接错误:", err);
+       setBackendStatus(`后端服务不可用: ${err.message}`);
+     });
+ }, []);
 
-  // 处理录音按钮点击
-  const handleRecordClick = useCallback(async () => {
-    // 如果当前正在播放或处理中，则取消当前任务
-    if (isAudioPlaying || processingRef.current) {
-      cancelProcessingTask();
-      return;
-    }
-    
-    if (isRecording) {
-      // 停止录音
-      await stopRecording();
-    } else {
-      // 开始录音
-      if (micStream) {
-        startRecording(micStream, setIsRecording, setRecordingStatus);
-      } else {
-        // 尝试重新获取麦克风权限
-        const stream = await setupMicrophone(setMicStatus);
-        if (stream) {
-          setMicStream(stream);
-          startRecording(stream, setIsRecording, setRecordingStatus);
-        } else {
-          alert("无法访问麦克风。请检查权限设置。");
-        }
-      }
-    }
-  }, [isRecording, micStream, stopRecording, isAudioPlaying, cancelProcessingTask]);
+ // 处理录音按钮点击
+ const handleRecordClick = useCallback(async () => {
+   // 如果当前正在播放或处理中，则取消当前任务
+   if (isAudioPlaying || processingRef.current) {
+     cancelProcessingTask();
+     return;
+   }
+   
+   if (isRecording) {
+     // 停止录音
+     await stopRecording();
+   } else {
+     // 开始录音
+     if (micStream) {
+       startRecording(micStream, setIsRecording, setRecordingStatus);
+     } else {
+       // 尝试重新获取麦克风权限
+       const stream = await setupMicrophone(setMicStatus);
+       if (stream) {
+         setMicStream(stream);
+         startRecording(stream, setIsRecording, setRecordingStatus);
+       } else {
+         alert("无法访问麦克风。请检查权限设置。");
+       }
+     }
+   }
+ }, [isRecording, micStream, stopRecording, isAudioPlaying, cancelProcessingTask]);
 
-  // 获取最后一条消息用于显示
-  const lastMessage = conversation.length > 0 ? conversation[conversation.length - 1] : null;
+ // 获取最后一条消息用于显示
+ const lastMessage = conversation.length > 0 ? conversation[conversation.length - 1] : null;
 
-  // 计算麦克风按钮文本
-  const getMicButtonText = useCallback(() => {
-    if (isRecording) return '■';
-    if (isAudioPlaying || processingRef.current) return '✕';
-    return '🎤';
-  }, [isRecording, isAudioPlaying]);
+ // 计算麦克风按钮文本
+ const getMicButtonText = useCallback(() => {
+   if (isRecording) return '■';
+   if (isAudioPlaying || processingRef.current) return '✕';
+   return '🎤';
+ }, [isRecording, isAudioPlaying]);
 
-  return (
-    <div style={STYLES.container}>
-      {/* 对话历史 (显示最后一条) */}
-      {lastMessage && (
-        <div style={STYLES.conversationBox}>
-          <div
-            style={lastMessage.role === 'user' ? STYLES.userBubble : STYLES.aiBubble}
-          >
-            {lastMessage.content}
-          </div>
-        </div>
-      )}
+ return (
+   <div style={STYLES.container}>
+     {/* 对话历史 (显示最后一条) */}
+     {lastMessage && (
+       <div style={STYLES.conversationBox}>
+         <div
+           style={lastMessage.role === 'user' ? STYLES.userBubble : STYLES.aiBubble}
+         >
+           {lastMessage.content}
+         </div>
+       </div>
+     )}
 
-      {/* 语音输入区域 */}
-      <div style={STYLES.speechArea}>
-        <button
-          onClick={handleRecordClick}
-          style={{
-            ...STYLES.recordButton,
-            ...(isRecording ? STYLES.recordingButton : {})
-          }}
-        >
-          <span style={STYLES.micIcon}>
-            {getMicButtonText()}
-          </span>
-        </button>
+     {/* 语音输入区域 */}
+     <div style={STYLES.speechArea}>
+       <button
+         onClick={handleRecordClick}
+         style={{
+           ...STYLES.recordButton,
+           ...(isRecording ? STYLES.recordingButton : {})
+         }}
+       >
+         <span style={STYLES.micIcon}>
+           {getMicButtonText()}
+         </span>
+       </button>
 
-        <div style={STYLES.statusText}>
-          {isRecording ? '正在录音...' : (statusMessage || '点击麦克风开始语音输入')}
-        </div>
-      </div>
+       <div style={STYLES.statusText}>
+         {isRecording ? '正在录音...' : (statusMessage || '点击麦克风开始语音输入')}
+       </div>
+     </div>
 
-      {/* 状态栏 */}
-      <div style={STYLES.statusBar}>
-        {backendStatus} | {wsReady ? 'WebSocket已连接' : 'HTTP模式'} | 动画: {animReady ? '已加载' : '无'} | {micStatus}
-      </div>
+     {/* 状态栏 */}
+     <div style={STYLES.statusBar}>
+       {backendStatus} | {wsReady ? 'WebSocket已连接' : 'HTTP模式'} | 动画: {animReady ? '已加载' : '无'} | {micStatus}
+     </div>
 
-      <Canvas dpr={2} onCreated={(ctx) => {
-          ctx.gl.physicallyCorrectLights = true;
-        }}>
+     <Canvas dpr={2} onCreated={(ctx) => {
+         ctx.gl.physicallyCorrectLights = true;
+       }}>
 
-        <OrthographicCamera
-          makeDefault
-          zoom={2000}
-          position={[0, 1.65, 1]}
-        />
+       <OrthographicCamera
+         makeDefault
+         zoom={2000}
+         position={[0, 1.65, 1]}
+       />
 
-        <Suspense fallback={null}>
-          <Environment background={false} files="/images/photo_studio_loft_hall_1k.hdr" />
-        </Suspense>
+       <Suspense fallback={null}>
+         <Environment background={false} files="/images/photo_studio_loft_hall_1k.hdr" />
+       </Suspense>
 
-        <Suspense fallback={null}>
-          <Bg />
-        </Suspense>
+       <Suspense fallback={null}>
+         <Bg />
+       </Suspense>
 
-        <Suspense fallback={null}>
-          <Avatar
-            avatar_url="/model.glb"
-            speak={speak}
-            setSpeak={setSpeak}
-            text={response}
-            playing={playing}
-            setPlaying={setPlaying}
-            setResponse={setResponse}
-            setAnimReady={setAnimReady}
-            animationData={animationData}
-            isAudioPlaying={isAudioPlaying}
-          />
-        </Suspense>
+       <Suspense fallback={null}>
+         <Avatar
+           avatar_url="/model.glb"
+           speak={speak}
+           setSpeak={setSpeak}
+           text={response}
+           playing={playing}
+           setPlaying={setPlaying}
+           setResponse={setResponse}
+           setAnimReady={setAnimReady}
+           animationData={animationData}
+           isAudioPlaying={isAudioPlaying}
+           currentSegmentIndex={currentAudioIndex}
+         />
+       </Suspense>
 
-      </Canvas>
-      <Loader dataInterpolation={(p) => `加载中... ${Math.round(p * 100)}%`} />
-    </div>
-  )
+     </Canvas>
+     <Loader dataInterpolation={(p) => `加载中... ${Math.round(p * 100)}%`} />
+   </div>
+ )
 }
 
 function Bg() {
-  const texture = useTexture('/images/bg.webp');
+ const texture = useTexture('/images/bg.webp');
 
-  return(
-    <mesh position={[0, 1.5, -2]} scale={[0.8, 0.8, 0.8]}>
-      <planeBufferGeometry />
-      <meshBasicMaterial map={texture} />
-    </mesh>
-  )
+ return(
+   <mesh position={[0, 1.5, -2]} scale={[0.8, 0.8, 0.8]}>
+     <planeBufferGeometry />
+     <meshBasicMaterial map={texture} />
+   </mesh>
+ )
 }
 
 export default App;
