@@ -25,7 +25,7 @@ from threading import Thread
 os.chdir("/home/zentek/Documents/GPT-SoVITS")
 GPT_SOVITS_PATH = "/home/zentek/Documents/GPT-SoVITS/GPT_SoVITS"
 AUDIO2FACE_SAMPLES_PATH = "/home/zentek/Documents/Audio2Face-3D-Samples"
-AUDIO_DIR = "/home/zentek/Documents/shared"
+AUDIO_DIR = "/home/zentek/Documents/audio"
 BLENDSHAPE_DIR = "/home/zentek/Documents/blendshape"
 TEMP_DIR = "/home/zentek/Documents/temp"
 

@@ -47,25 +47,11 @@ client = openai.OpenAI(
 # 创建线程池
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
-# 缓存变量 - 用于存储已加载的模型和优化TTS处理
-_tts_model_cache = None
-_last_tts_request_time = None
-_tts_model_load_time = None
-
 # 加载GPT-SoVITS模型
 def load_gptsovits_model(config_path=None):
-    global _tts_model_cache, _tts_model_load_time
-    
-    # 如果已有缓存的模型，且加载不超过24小时，直接返回
-    current_time = time.time()
-    if _tts_model_cache is not None and _tts_model_load_time is not None:
-        # 检查模型是否是最近24小时内加载的
-        if current_time - _tts_model_load_time < 24 * 3600:
-            logger.info("使用缓存的GPT-SoVITS模型")
-            return _tts_model_cache
-        else:
-            logger.info("缓存的模型已超过24小时，重新加载")
-    
+    """
+    加载GPT-SoVITS模型，不使用缓存机制
+    """
     if not gptsovits_available:
         logger.error("GPT-SoVITS模块不可用")
         return None
@@ -89,10 +75,6 @@ def load_gptsovits_model(config_path=None):
             
         # 初始化TTS模型
         tts_model = TTS(tts_config)
-        
-        # 更新缓存
-        _tts_model_cache = tts_model
-        _tts_model_load_time = current_time
         
         logger.info("GPT-SoVITS模型加载成功")
         return tts_model
@@ -280,13 +262,7 @@ async def text_to_speech_optimized(text, tts_model, ref_audio_path, audio_dir):
     返回:
         (audio_numpy_array, audio_file_path)
     """
-    global _last_tts_request_time
-    
     start_time = time.time()
-    current_time = start_time
-    
-    # 更新上次请求时间
-    _last_tts_request_time = current_time
     
     try:
         if tts_model is None or ref_audio_path is None:
