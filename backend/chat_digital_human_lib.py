@@ -48,7 +48,7 @@ client = openai.OpenAI(
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
 # 加载GPT-SoVITS模型
-def load_gptsovits_model(config_path=None):
+def load_gptsovits_model(config_path=None,version='v4'):
     """
     加载GPT-SoVITS模型，不使用缓存机制
     """
@@ -290,7 +290,7 @@ async def text_to_speech_optimized(text, tts_model, ref_audio_path, audio_dir):
             "text": text,
             "text_lang": "zh",  # 默认中文，可根据需要修改
             "ref_audio_path": ref_audio_path,
-            "prompt_text": "",  # 如果需要提示文本可以添加
+            "prompt_text": "欸？已经被你看出来了吗？我还以为我装得够像了。",  # 如果需要提示文本可以添加
             "prompt_lang": "zh",  # 与text_lang保持一致
             "text_split_method": "cut5",  # 使用预定义的分割方法
             "speed_factor": 1.0,  # 语速因子
