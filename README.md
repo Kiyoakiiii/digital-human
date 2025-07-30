@@ -55,7 +55,7 @@
 ### **第2步：克隆项目代码**
 
 ```bash
-git clone [https://github.com/Kiyoakiiii/digital-human.git](https://github.com/Kiyoakiiii/digital-human.git)
+git clone https://github.com/Kiyoakiiii/digital-human.git
 cd digital-human
 ```
 
@@ -109,16 +109,4 @@ cd digital-human
 服务启动后，在您的浏览器中打开前端页面的地址，通常是 `http://<你的前端服务器IP>:3000`。点击麦克风按钮，开始和您的数字人对话吧！
 
 
-```
----
-
-## 🗺️ 未来规划 (Roadmap)
-
-* [ ] **情感化表达:** 从文本（LLM分析）或语音（Riva分析）中识别情感，并用它来驱动虚拟人做出带有情绪的面部表情，让交互更生动。
-* [ ] **动态虚拟人切换:** 允许用户在前端动态加载和切换不同的3D虚拟人模型。
-* [ ] **配置中心化:** 将所有硬编码的IP地址、API密钥和文件路径移至一个统一的 `.env` 或 `config.yaml` 配置文件中，简化部署。
-* [ ] **后端容器化:** 将整个后端应用（包括GPT-SoVITS模型）打包成一个Docker镜像，实现一键部署。
-* [ ] **头部与身体姿态:** 添加更多自然的头部和上半身动画，打破静态感，让虚拟人看起来更像在“思考”和“倾听”。
-
----
 
