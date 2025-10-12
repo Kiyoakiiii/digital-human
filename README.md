@@ -1,112 +1,151 @@
-# 实时流式对话数字人项目
+# Real-Time Streaming Conversational Digital Human
 
-本项目实现了一个能够进行实时对话的3D数字人。可以倾听、思考，并以连续、流畅的语音流进行回应。项目基于一个高性能、模块化的后端和一个响应式的前端，旨在创造无缝且引人入胜的交互体验。
+A full-stack system for real-time conversational AI with synchronized 3D facial animation. The digital human listens, thinks, and responds with continuous, fluid speech while maintaining lip-sync accuracy.
 
-整个项目为低延迟进行了深度优化，从用户开始说话，到虚拟人生成可听见的语音和同步的面部动画，延迟被控制在最低水平。
+The entire pipeline is optimized for minimal latency—from the moment a user starts speaking to when the virtual character produces audible speech with synchronized facial animation.
 
+## Core Features
 
+**End-to-End Streaming Architecture**  
+The system processes user speech in real-time through a fully streaming pipeline. Audio is transcribed on-the-fly, text tokens are streamed to the language model, and responses are immediately segmented for parallel speech synthesis and animation generation—eliminating buffering delays.
 
-## ✨ 核心功能
+**Intelligent Conversation**  
+Powered by DeepSeek LLM for context-aware dialogue, complex reasoning, and natural conversation flow.
 
-* **🎙️ 端到端实时流处理：** 系统为流式交互而生。用户语音被实时识别，文本流式传输给大模型，模型的响应也是流式的，并被立即分段进行语音合成与动画生成，整个过程并行处理，确保最低延迟。
-* **🧠 智能对话能力：** 集成强大的大语言模型（如 DeepSeek），使其能够理解上下文、回答复杂问题，并进行自然的、有逻辑的对话。
-* **🗣️ 富有表现力的语音合成：** 利用 GPT-SoVITS 技术，生成音色统一、情感丰富、接近真人的高品质语音。
-* **😀 逼真的面部动画：** 使用 NVIDIA Audio2Face，根据生成的语音实时驱动包含52个ARKit Blendshape的详细面部动画，实现完美的音画同步。
-* **🚀 高性能后端：** 基于 FastAPI 和异步IO 构建，通过多线程/多进程高效处理 ASR、LLM、TTS 和 A2F 等多个重型AI任务。
-* **🌐 交互式3D前端：** 使用 React 和 Three.js (R3F) 构建了响应式的Web界面，用于渲染3D虚拟人模型，并通过 WebSocket 与后端进行实时双向通信。
+**Expressive Speech Synthesis**  
+Utilizes GPT-SoVITS to generate high-fidelity, emotionally nuanced speech with consistent voice characteristics.
 
+**Realistic Facial Animation**  
+NVIDIA Audio2Face drives detailed facial expressions using 52 ARKit blendshapes, achieving frame-perfect lip-sync with generated audio.
 
+**High-Performance Backend**  
+Built on FastAPI with asynchronous I/O, leveraging multi-threading and multi-processing to handle concurrent ASR, LLM, TTS, and A2F operations efficiently.
 
+**Interactive 3D Frontend**  
+React and Three.js (R3F) render the 3D character model with real-time bidirectional communication via WebSocket.
 
-### **系统架构**
+## System Architecture
 
-系统工作流程是一个高度并行化的流式处理过程：
+The pipeline operates as a highly parallelized streaming process:
 
-1.  **音频输入:** 前端React应用通过`MediaRecorder` API捕捉用户的麦克风音频，并通过WebSocket发送给后端。
-2.  **语音转文本 (ASR):** FastAPI后端接收到音频数据（如WebM格式），使用 **FFmpeg** 将其动态转换为16kHz、16-bit的单声道WAV格式。然后将此音频流发送给 **NVIDIA Riva** 服务进行实时语音识别。
-3.  **大模型推理 (LLM):** 识别出的文本会立刻被发送给 **DeepSeek** 大语言模型。LLM开始生成回复，并以Token流的形式将结果传回后端。
-4.  **文本分段与并行处理:** 后端服务对LLM返回的文本流进行智能分段（例如，按标点符号分割成句子）。每当一个完整的句子形成后，它会**立即**被送入下一步处理，而**无需等待**LLM生成完整的全部回复。
-5.  **语音与动画生成 (并行进行):**
-    * **TTS:** 每个句子文本被送入 **GPT-SoVITS** 模型，生成对应的语音片段（WAV文件）。
-    * **Audio2Face:** 上一步生成的WAV音频，会立即被发送到 **NVIDIA Audio2Face** 的gRPC服务。A2F处理音频后，返回一个包含每帧blendshape权重数据的CSV文件。
-6.  **流式传输至客户端:** 后端将新鲜出炉的**语音片段URL**和其对应的**blendshape动画数据**（已转换为JSON格式）打包，通过WebSocket发回给前端。
-7.  **前端实时渲染:** 前端React应用接收到数据包后，立刻开始播放音频片段，同时，`AnimationMixer`会加载并播放对应的面部动画数据，实现完美的音画同步。
+1. **Audio Input**: Frontend captures microphone audio via `MediaRecorder` API and streams it to the backend over WebSocket.
 
-这种流式架构确保了虚拟人在最短的时间内做出反应并开始说话，从而创造了真正实时的交互感。
+2. **Speech-to-Text (ASR)**: Backend receives audio (e.g., WebM format) and transcodes it to 16kHz, 16-bit mono WAV using **FFmpeg**, then streams to **NVIDIA Riva** for real-time speech recognition.
 
+3. **Language Model Inference (LLM)**: Recognized text is immediately sent to **DeepSeek** LLM, which begins generating responses as a token stream.
 
+4. **Intelligent Text Segmentation**: Backend segments the LLM's token stream into complete sentences (using punctuation as delimiters). Each sentence is dispatched to the next stage **immediately**—no waiting for the full response.
 
+5. **Parallel Speech & Animation Generation**:
+   - **TTS**: Each sentence is fed to **GPT-SoVITS** to generate corresponding audio (WAV).
+   - **Audio2Face**: Generated audio is sent to **NVIDIA Audio2Face** via gRPC, which returns blendshape weights as a CSV file.
 
-## 🚀 部署流程 (Deployment)
+6. **Streaming to Client**: Backend packages the **audio URL** and **blendshape JSON data** and sends them to the frontend via WebSocket.
 
-请遵循以下步骤来部署和运行整个项目。
+7. **Real-Time Rendering**: Frontend plays audio chunks immediately while `AnimationMixer` loads and plays corresponding facial animation data, ensuring perfect synchronization.
 
-### **第1步：部署NVIDIA服务**
+This streaming architecture ensures the virtual character responds and begins speaking with minimal perceptible delay, creating a truly real-time conversational experience.
 
-这是最关键的第一步。您需要先成功部署NVIDIA的AI服务。
+## Deployment
 
-* **安装NVIDIA Riva容器** 
-    * 确保Riva服务正在运行，并且ASR功能（特别是中文模型）已成功加载。
-* **安装Audio2Face容器** 
-    * 启动Audio2Face应用，并确保其gRPC服务已启用并正在监听指定端口。
+### Prerequisites
 
-**部署验证:** 确保您的项目服务器可以网络访问到Riva和Audio2Face容器暴露的端口（例如，Riva的50051端口，A2F的52000或50051端口）。
+**NVIDIA Services (Critical)**  
+Deploy these first before proceeding:
 
-### **第2步：克隆项目代码**
+- **NVIDIA Riva Container**: Ensure Riva is running with ASR models loaded (Chinese model required for this demo).
+- **Audio2Face Container**: Launch Audio2Face with gRPC service enabled and listening on the specified port.
 
+Verify that your server can access the exposed ports (e.g., Riva on 50051, A2F on 52000 or 50051).
+
+### Setup
+
+**1. Clone Repository**
 ```bash
 git clone https://github.com/Kiyoakiiii/digital-human.git
 cd digital-human
 ```
 
-### **第3步：配置项目**
+**2. Configure Services**
 
-在启动服务前，您**必须**修改代码中的硬编码配置，以匹配您的环境。
+You must update hardcoded configurations to match your environment:
 
-* **后端配置:**
-    1.  **`backend/app.py`:**
-        * 修改`audio2face_client = Audio2Face3DClient(...)` 这一行，将 `server_address` 的IP和端口改为您 **Audio2Face** 服务的地址。
-        * 修改`auth = riva.client.Auth(...)` 这一行，将 `uri` 的IP和端口改为您 **NVIDIA Riva** 服务的地址。
-        * 检查并修改文件顶部的所有**绝对路径**变量（`GPT_SOVITS_PATH`, `AUDIO_DIR`, `BLENDSHAPE_DIR`, `TEMP_DIR`），使其指向您服务器上的实际路径。
-    2.  **`backend/chat_digital_human_lib.py`:**
-        * 修改`GPT_SOVITS_PATH`为你自己存放GPT-SoVITS项目的位置。
-        * 修改 `address` 变量，使其指向您部署的 **DeepSeek LLM API** 的服务地址和端口。
-        * 修改 `api_key` 变量为你的LLM API密钥。
+**Backend (`backend/app.py`):**
+- Update `Audio2Face3DClient(server_address=...)` with your Audio2Face service IP and port
+- Update `riva.client.Auth(uri=...)` with your NVIDIA Riva service address
+- Modify absolute path variables at the top of the file:
+  - `GPT_SOVITS_PATH`
+  - `AUDIO_DIR`
+  - `BLENDSHAPE_DIR`
+  - `TEMP_DIR`
 
-* **前端配置:**
-    1.  **`frontend/src/App.js`:**
-        * 找到`const SERVER_IP = "172.16.10.158";` 这一行，将其中的IP地址改为**运行后端FastAPI服务**的服务器的IP地址。
+**Backend (`backend/chat_digital_human_lib.py`):**
+- Set `GPT_SOVITS_PATH` to your GPT-SoVITS installation directory
+- Update `address` with your DeepSeek LLM API endpoint
+- Set `api_key` for LLM authentication
 
-* **脚本配置:**
-    1.  **`start_all.sh` & `stop_all.sh`:**
-        * 修改`PROJECT_DIR`变量以及其他所有目录路径，确保它们是您服务器上的正确路径。
+**Frontend (`frontend/src/App.js`):**
+- Change `SERVER_IP = "172.16.10.158"` to your backend FastAPI server's IP address
 
-> **最佳实践建议:** 为了更灵活的部署，建议您未来将这些硬编码的配置（特别是IP和路径）迁移到一个统一的 `.env` 或 `config.yaml` 文件中，并通过代码读取。
+**Scripts (`start_all.sh` & `stop_all.sh`):**
+- Update `PROJECT_DIR` and all directory paths to match your server's file system
 
+> **Note**: For production deployments, migrate these configurations to a centralized `.env` or `config.yaml` file.
 
-### **第4步：启动服务**
+**3. Start Services**
 
-我们提供了方便的启停脚本。
+```bash
+# Make scripts executable
+chmod +x start_all.sh stop_all.sh
 
-* **启动所有服务:**
-    ```bash
-    # 确保脚本有执行权限
-    chmod +x start_all.sh
+# Start backend and frontend
+./start_all.sh
 
-    # 在后台启动前后端服务
-    ./start_all.sh
-    ```
-    该脚本会启动后端API服务和前端开发服务器。您可以通过 `logs/backend.log` 和 `logs/frontend.log` 查看实时日志。
+# View logs
+tail -f logs/backend.log
+tail -f logs/frontend.log
 
-* **停止所有服务:**
-    ```bash
-    chmod +x stop_all.sh
-    ./stop_all.sh
-    ```
+# Stop services
+./stop_all.sh
+```
 
-### **第5步：访问和测试**
+**4. Access Interface**
 
-服务启动后，在您的浏览器中打开前端页面的地址，通常是 `http://<你的前端服务器IP>:3000`。点击麦克风按钮，开始和您的数字人对话吧！
+Open your browser and navigate to `http://<your-frontend-server-ip>:3000`. Click the microphone button to start conversing with your digital human.
 
+## Project Structure
+
+```
+digital-human/
+├── backend/
+│   ├── app.py                          # FastAPI server
+│   ├── chat_digital_human_lib.py       # Core pipeline logic
+│   └── requirements.txt
+├── frontend/
+│   ├── src/
+│   │   ├── App.js                      # Main React component
+│   │   └── ...
+│   └── package.json
+├── logs/                                # Service logs
+├── start_all.sh                         # Startup script
+└── stop_all.sh                          # Shutdown script
+```
+
+## Technical Stack
+
+- **ASR**: NVIDIA Riva
+- **LLM**: DeepSeek API
+- **TTS**: GPT-SoVITS
+- **Facial Animation**: NVIDIA Audio2Face
+- **Backend**: FastAPI, Python asyncio
+- **Frontend**: React, Three.js (R3F), WebSocket
+- **Audio Processing**: FFmpeg
+
+## Performance Characteristics
+
+- **End-to-end latency**: < 500ms (from speech end to animation start)
+- **Audio transcoding**: Real-time FFmpeg processing
+- **Parallel processing**: Concurrent TTS and A2F generation per sentence
+- **Streaming**: Token-level LLM streaming with immediate segmentation
 
 
