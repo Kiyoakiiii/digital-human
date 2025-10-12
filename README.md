@@ -212,29 +212,6 @@ http://<your-frontend-server-ip>:3000
 
 Click the microphone button to start voice interaction.
 
-## Project Structure
-
-```
-digital-human/
-├── backend/
-│   ├── app.py                          # FastAPI server with WebSocket
-│   ├── chat_digital_human_lib.py       # LLM and TTS integration
-│   ├── audio2face3d_client.py          # A2F gRPC client with fallback
-│   └── requirements.txt                # Python dependencies
-├── frontend/
-│   ├── src/
-│   │   ├── App.js                      # Main React component
-│   │   ├── converter.js                # Blendshape to AnimationClip converter
-│   │   └── blendDataBlink.json         # Blink animation data
-│   ├── public/
-│   │   ├── model.glb                   # 3D character model
-│   │   ├── idle.fbx                    # Idle animation
-│   │   └── images/                     # Textures and HDR environment
-│   └── package.json                    # Node dependencies
-├── logs/                                # Service logs
-├── start_all.sh                         # Startup script
-└── stop_all.sh                          # Shutdown script
-```
 
 ## Technical Stack
 
@@ -248,7 +225,7 @@ digital-human/
 
 ## Performance Characteristics
 
-- **End-to-end latency**: < 500ms from speech end to first animation frame
+- **End-to-end latency**: < 1s from speech end to first animation frame
 - **First segment response**: Optimized segmentation delivers initial speech within 2-3 seconds
 - **Audio transcoding**: Real-time FFmpeg processing with < 100ms overhead
 - **Parallel processing**: TTS and A2F generation run concurrently per sentence
@@ -257,20 +234,7 @@ digital-human/
 - **Blendshape fallback**: Procedural generator activates within 5s timeout for A2F failures
 - **Connection resilience**: Automatic WebSocket reconnection with 5s intervals
 
-## API Endpoints
 
-**HTTP REST API**:
-- `POST /talk` - Submit text for TTS processing (requires client_id)
-- `POST /recognize_speech` - Upload audio for ASR (multipart/form-data)
-- `GET /status` - Check service and model status
-- `GET /health` - Health check endpoint
-- `GET /info` - System resource information
-
-**WebSocket** (`/ws/{client_id}`):
-- `talk` - Submit text for streaming TTS processing
-- `speech_recognition` - Submit base64 audio for ASR
-- `ping` - Keep-alive heartbeat
-- Receives: `stream_audio_segment`, `processing_complete_all`, `processing_status`, `error`
 
 
 
